@@ -12,6 +12,8 @@ fn usage() {
          \n  tasks                       show the board\
          \n  run <id>                    send task to its assignee (dev implements, reviewer reviews)\
          \n  rework <id>                 developer addresses review feedback\
+         \n  assign <id> <who>           assign a task (backlog -> assigned)\
+         \n  review <id> <feedback>      send task back to in-progress with feedback\
          \n  quit"
     );
 }
@@ -62,6 +64,20 @@ pub fn run(board: Board) -> Result<()> {
                 "rework" => {
                     let id: u32 = rest.parse()?;
                     println!("{}", ops::rework(&mut board, id)?);
+                }
+                "assign" => {
+                    let (id, who) = rest
+                        .split_once(' ')
+                        .ok_or_else(|| anyhow::anyhow!("usage: assign <id> <who>"))?;
+                    let id: u32 = id.parse()?;
+                    println!("{}", ops::assign(&mut board, id, who)?);
+                }
+                "review" => {
+                    let (id, feedback) = rest
+                        .split_once(' ')
+                        .ok_or_else(|| anyhow::anyhow!("usage: review <id> <feedback>"))?;
+                    let id: u32 = id.parse()?;
+                    println!("{}", ops::review(&mut board, id, feedback)?);
                 }
                 "help" => usage(),
                 other => bail!("unknown command: {other}"),

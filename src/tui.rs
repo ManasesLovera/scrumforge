@@ -24,6 +24,7 @@ enum Mode {
     Normal,
     Command { prompt: String, input: String },
     Help,
+    Task,
 }
 
 enum Action {
@@ -159,6 +160,35 @@ impl App {
             return;
         }
         match &mut self.mode {
+            Mode::Task => {
+                self.mode = Mode::Normal;
+                match code {
+                    KeyCode::Char('r') => {
+                        if let Some(id) = self.selected_id() {
+                            let who = self
+                                .board
+                                .get(id)
+                                .and_then(|t| t.assignee.clone())
+                                .unwrap_or_else(|| "developer".into());
+                            self.start_busy(&format!("{who} working on task #{id}…"));
+                            self.pending = Some(Action::Run(id));
+                        }
+                    }
+                    KeyCode::Char('w') => {
+                        if let Some(id) = self.selected_id() {
+                            self.start_busy(&format!("developer reworking task #{id}…"));
+                            self.pending = Some(Action::Rework(id));
+                        }
+                    }
+                    KeyCode::Char('v') => {
+                        self.mode = Mode::Command {
+                            prompt: "review: ".into(),
+                            input: String::new(),
+                        };
+                    }
+                    _ => {}
+                }
+            }
             Mode::Help => self.mode = Mode::Normal,
             Mode::Command { prompt, input } => match code {
                 KeyCode::Esc => self.mode = Mode::Normal,
@@ -175,7 +205,8 @@ impl App {
                 _ => {}
             },
             Mode::Normal => match code {
-                KeyCode::Char('q') | KeyCode::Esc => self.quit = true,
+                KeyCode::Char('q') => self.quit = true,
+                KeyCode::Esc => self.mode = Mode::Normal,
                 KeyCode::Char('?') | KeyCode::F(1) => self.mode = Mode::Help,
                 KeyCode::Left | KeyCode::Char('h') => self.move_col(-1),
                 KeyCode::Right | KeyCode::Char('l') => self.move_col(1),
@@ -199,7 +230,14 @@ impl App {
                         input: String::new(),
                     };
                 }
-                KeyCode::Char('r') | KeyCode::Enter => {
+                KeyCode::Enter => {
+                    if self.selected_id().is_some() {
+                        self.mode = Mode::Task;
+                    } else {
+                        self.message = "no task selected".into();
+                    }
+                }
+                KeyCode::Char('r') => {
                     if let Some(id) = self.selected_id() {
                         let who = self
                             .board
@@ -218,6 +256,16 @@ impl App {
                         self.pending = Some(Action::Rework(id));
                     }
                 }
+                KeyCode::Char('v') => {
+                    if self.selected_id().is_some() {
+                        self.mode = Mode::Command {
+                            prompt: "review: ".into(),
+                            input: String::new(),
+                        };
+                    } else {
+                        self.message = "no task selected".into();
+                    }
+                }
                 _ => {}
             },
         }
@@ -229,6 +277,13 @@ impl App {
             return;
         }
         let res: Result<String> = match prompt {
+            "review: " => {
+                if let Some(id) = self.selected_id() {
+                    ops::review(&mut self.board, id, line)
+                } else {
+                    Err(anyhow::anyhow!("no task selected"))
+                }
+            }
             "add: " => ops::add_backlog_task(&mut self.board, line),
             "request: " => {
                 self.start_busy("scrum master is planning…");
@@ -253,6 +308,20 @@ impl App {
                             return;
                         }
                         Err(_) => Err(anyhow::anyhow!("usage: rework <id>")),
+                    },
+                    "assign" => match rest.split_once(' ') {
+                        Some((id, who)) => match id.parse::<u32>() {
+                            Ok(id) => ops::assign(&mut self.board, id, who),
+                            Err(_) => Err(anyhow::anyhow!("usage: assign <id> <who>")),
+                        },
+                        None => Err(anyhow::anyhow!("usage: assign <id> <who>")),
+                    },
+                    "review" => match rest.split_once(' ') {
+                        Some((id, feedback)) => match id.parse::<u32>() {
+                            Ok(id) => ops::review(&mut self.board, id, feedback),
+                            Err(_) => Err(anyhow::anyhow!("usage: review <id> <feedback>")),
+                        },
+                        None => Err(anyhow::anyhow!("usage: review <id> <feedback>")),
                     },
                     "quit" => {
                         self.quit = true;
@@ -303,6 +372,9 @@ fn draw(f: &mut Frame, app: &mut App) {
     }
     if let Mode::Help = app.mode {
         draw_help(f);
+    }
+    if let Mode::Task = app.mode {
+        draw_task_modal(f, app);
     }
 }
 
@@ -411,6 +483,8 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
             Span::raw("un  "),
             Span::styled("w", Style::default().fg(Color::Green).bold()),
             Span::raw("rework  "),
+            Span::styled("v", Style::default().fg(Color::Green).bold()),
+            Span::raw("review  "),
             Span::styled(":", Style::default().fg(Color::Green).bold()),
             Span::raw("cmd  "),
             Span::styled("?", Style::default().fg(Color::Green).bold()),
@@ -444,18 +518,71 @@ fn draw_busy(f: &mut Frame, msg: &str) {
     );
 }
 
+fn draw_task_modal(f: &mut Frame, app: &App) {
+    let area = centered(f.area(), 60, 60);
+    let task = app.selected_id().and_then(|id| app.board.get(id));
+    let body = match task {
+        Some(t) => vec![
+            Line::from(vec![
+                Span::styled(format!("#{} ", t.id), Style::default().fg(Color::Cyan).bold()),
+                Span::styled(t.title.clone(), Style::default().add_modifier(Modifier::BOLD)),
+            ]),
+            Line::from(Span::styled(
+                if t.description.is_empty() { "(no description)".into() } else { t.description.clone() },
+                Style::default().fg(Color::Gray),
+            )),
+            "".into(),
+            Line::from(vec![
+                Span::styled("status:   ", Style::default().fg(Color::DarkGray)),
+                Span::styled(format!("{}", t.status), Style::default().fg(Color::Yellow)),
+            ]),
+            Line::from(vec![
+                Span::styled("assignee: ", Style::default().fg(Color::DarkGray)),
+                Span::raw(t.assignee.clone().unwrap_or_else(|| "unassigned".into())),
+            ]),
+            Line::from(vec![
+                Span::styled("branch:   ", Style::default().fg(Color::DarkGray)),
+                Span::raw(t.branch.clone().unwrap_or_else(|| "—".into())),
+            ]),
+            t.pr_url.clone().map(|u| Line::from(vec![
+                Span::styled("PR:       ", Style::default().fg(Color::DarkGray)),
+                Span::styled(u, Style::default().fg(Color::LightBlue).underlined()),
+            ])).unwrap_or_default(),
+            t.review_notes.clone().filter(|n| !n.is_empty()).map(|n| Line::from(vec![
+                Span::styled("review:   ", Style::default().fg(Color::DarkGray)),
+                Span::raw(n),
+            ])).unwrap_or_default(),
+            "".into(),
+            Line::from(Span::styled(
+                "r run · w rework · Esc close",
+                Style::default().fg(Color::DarkGray),
+            )),
+        ],
+        None => vec![Line::from("no task selected")],
+    };
+    f.render_widget(Clear, area);
+    f.render_widget(
+        Paragraph::new(body)
+            .wrap(Wrap { trim: false })
+            .block(Block::default().borders(Borders::ALL).title(" Task ")),
+        area,
+    );
+}
+
 fn draw_help(f: &mut Frame) {
     let area = centered(f.area(), 60, 50);
     let help = vec![
         Line::from(Span::styled("keys", Style::default().fg(Color::Cyan).bold())),
         " ←/h →/l   select column".into(),
         " ↑/k ↓/j   select task".into(),
-        " r / Enter send task to its assignee".into(),
+        " Enter     open selected task (Esc closes)".into(),
+        " r         send task to its assignee".into(),
         " w         developer reworks after changes requested".into(),
+        " v         review: send task back in progress with feedback".into(),
         " R         ask scrum master to plan a request".into(),
         " a         add a backlog task (\"title\" | \"desc\")".into(),
-        " :         command mode (run/rework/quit…)".into(),
-        " q / Esc   quit (Esc closes help first)".into(),
+        " :         command mode (run/rework/assign/quit…)".into(),
+        " q         quit (Esc closes modals)".into(),
         "".into(),
         Line::from(Span::styled("flow", Style::default().fg(Color::Cyan).bold())),
         " request → assigned → run → in-review → run (reviewer)".into(),

@@ -57,6 +57,34 @@ pub fn run_task(board: &mut Board, id: u32) -> Result<String> {
     }
 }
 
+pub fn assign(board: &mut Board, id: u32, who: &str) -> Result<String> {
+    let who = who.trim();
+    if who.is_empty() {
+        bail!("usage: assign <id> <developer|reviewer|name>");
+    }
+    board.update(id, |task| {
+        task.assignee = Some(who.to_string());
+        if task.status == Status::Backlog {
+            task.status = Status::Assigned;
+        }
+    })?;
+    Ok(format!("task #{id} assigned to {who}"))
+}
+
+pub fn review(board: &mut Board, id: u32, feedback: &str) -> Result<String> {
+    let feedback = feedback.trim();
+    if feedback.is_empty() {
+        bail!("usage: review <id> <feedback>");
+    }
+    board.update(id, |task| {
+        task.status = Status::InProgress;
+        task.review_notes = Some(feedback.to_string());
+    })?;
+    Ok(format!(
+        "task #{id}: review sent back in progress — {feedback}"
+    ))
+}
+
 pub fn rework(board: &mut Board, id: u32) -> Result<String> {
     agents::developer_rework(board, id)?;
     Ok(format!("task #{id}: rework pushed, back in review"))

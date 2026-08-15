@@ -26,6 +26,10 @@ COMMANDS:
                                           reviewer approves+merges or requests
                                           changes)
       rework <id>                         developer addresses review feedback
+      assign <id> <who>                  assign a task (developer/reviewer/name);
+                                          moves backlog tasks to assigned
+      review <id> <feedback>             send a task back to in-progress with
+                                          review feedback attached
       help                                show this help
 
 OPTIONS:
@@ -102,11 +106,21 @@ pub fn run(mut board: Board, cmd: &str, args: &[String]) -> Result<()> {
             eprintln!("working on task #{id}…");
             println!("{}", ops::run_task(&mut b, id)?);
         }
+        "review" => {
+            let id = parse_id(args)?;
+            let feedback = args.get(1..).map(|s| s.join(" ")).unwrap_or_default();
+            println!("{}", ops::review(&mut board, id, &feedback)?);
+        }
         "rework" => {
             let id = parse_id(args)?;
             let mut b = board;
             eprintln!("developer reworking task #{id}…");
             println!("{}", ops::rework(&mut b, id)?);
+        }
+        "assign" => {
+            let id = parse_id(args)?;
+            let who = args.get(1..).map(|s| s.join(" ")).unwrap_or_default();
+            println!("{}", ops::assign(&mut board, id, &who)?);
         }
         other => bail!("unknown command: {other} (see scrumforge --help)"),
     }

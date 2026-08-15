@@ -5,6 +5,9 @@ An AI scrum team orchestrator. You act as **product owner**; AI agents — drive
 **code reviewer**. Tasks flow across a scrum board, developers work in isolated git
 worktrees and open pull requests, reviewers approve+merge or send work back.
 
+Works with any coding agent as the driver: Claude Code, Codex, opencode, Cursor,
+etc. — see [AGENTS-CLI.md](AGENTS-CLI.md) for the agent-facing CLI guide.
+
 ```text
 backlog ─> assigned ─> in-progress ─> in-review ─> done
                           ^               │
@@ -39,32 +42,39 @@ scrumforge --help     # full usage for every mode
 
 ### Non-interactive CLI (scripts and AI agents)
 
+Full guide for coding agents (Claude Code, Codex, opencode, …):
+[AGENTS-CLI.md](AGENTS-CLI.md).
+
 ```bash
 scrumforge request "add pagination to the user list endpoint"
 scrumforge backlog "fix login bug" | "session expires immediately"
 scrumforge tasks              # list the board
 scrumforge show 1             # full task detail
+scrumforge assign 1 developer # set assignee (backlog -> assigned)
 scrumforge run 1              # developer implements, pushes, opens PR
 scrumforge run 1              # reviewer approves+merges, or requests changes
 scrumforge rework 1           # developer addresses review feedback
+scrumforge review 1 "needs tests"  # send back in-progress with feedback
 ```
 
 `request` asks the scrum master agent to split your request into tasks and assign
 each to the developer or reviewer. `run` dispatches a task to its assignee; running
 an in-review task triggers the reviewer.
 
-### TUI keys
+### TUI keys (humans)
 
 | Key | Action |
 | --- | --- |
 | `hjkl` / arrows | navigate columns and tasks |
-| `r` / `Enter` | send selected task to its assignee |
+| `Enter` | open selected task modal (`r` run, `w` rework, `v` review, `Esc` close) |
+| `r` | send selected task to its assignee |
 | `w` | developer reworks after changes requested |
+| `v` | review: send task back in progress with feedback |
 | `R` | ask the scrum master to plan a request |
 | `a` | add a backlog task |
-| `:` | command mode (`run 3`, `rework 3`, `quit`) |
+| `:` | command mode (`run 3`, `assign 3 reviewer`, `review 3 ...`, `quit`) |
 | `?` | help overlay |
-| `q` / `Esc` | quit |
+| `q` | quit (`Esc` closes modals/help) |
 
 ## How it works
 
@@ -89,6 +99,7 @@ cargo run -- tasks     # CLI
 ```
 
 - [AGENTS.md](AGENTS.md) — guidance for coding agents working on this repo
+- [AGENTS-CLI.md](AGENTS-CLI.md) — CLI guide for coding agents *using* scrumforge
 - [GUIDE.md](GUIDE.md) — role playbooks for the agents scrumforge hires
 - [install.sh](install.sh) — build + alias installer
 
