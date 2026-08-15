@@ -14,6 +14,8 @@ fn usage() {
          \n  rework <id>                 developer addresses review feedback\
          \n  assign <id> <who>           assign a task (backlog -> assigned)\
          \n  review <id> <feedback>      send task back to in-progress with feedback\
+         \n  help [topic]                long-form guide (overview, lifecycle, commands,\
+         \n                              tui, repl, agents, files, requirements)\
          \n  quit"
     );
 }
@@ -79,7 +81,13 @@ pub fn run(board: Board) -> Result<()> {
                     let id: u32 = id.parse()?;
                     println!("{}", ops::review(&mut board, id, feedback)?);
                 }
-                "help" => usage(),
+                "help" => {
+                    if rest.is_empty() {
+                        usage();
+                    } else {
+                        crate::help::print(&[rest.to_string()]);
+                    }
+                }
                 other => bail!("unknown command: {other}"),
             }
             Ok(())

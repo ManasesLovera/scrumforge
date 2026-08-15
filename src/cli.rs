@@ -30,10 +30,13 @@ COMMANDS:
                                           moves backlog tasks to assigned
       review <id> <feedback>             send a task back to in-progress with
                                           review feedback attached
-      help                                show this help
+      help [topic]                        long-form guide to everything
+                                          scrumforge does (topics: overview,
+                                          lifecycle, commands, tui, repl,
+                                          agents, files, requirements)
 
 OPTIONS:
-    -h, --help                 show this help
+    -h, --help                 show this usage summary
     -V, --version              show version
 
 EXAMPLES:
@@ -122,7 +125,8 @@ pub fn run(mut board: Board, cmd: &str, args: &[String]) -> Result<()> {
             let who = args.get(1..).map(|s| s.join(" ")).unwrap_or_default();
             println!("{}", ops::assign(&mut board, id, &who)?);
         }
-        other => bail!("unknown command: {other} (see scrumforge --help)"),
+        "help" => crate::help::print(args),
+        other => bail!("unknown command: {other} (see scrumforge help)"),
     }
     Ok(())
 }

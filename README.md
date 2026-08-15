@@ -37,8 +37,13 @@ its board (`.scrumforge.db`, SQLite) is used, so every project keeps its own tas
 ```bash
 scrumforge            # interactive TUI (humans)
 scrumforge repl       # line-oriented REPL
-scrumforge --help     # full usage for every mode
+scrumforge help       # long-form guide to everything scrumforge does
+scrumforge --help     # terse usage summary
 ```
+
+`scrumforge help` also takes a topic — `overview`, `lifecycle`, `commands`, `tui`,
+`repl`, `agents`, `files`, `requirements` — e.g. `scrumforge help tui`. It works
+outside a git repository too.
 
 ### Non-interactive CLI (scripts and AI agents)
 

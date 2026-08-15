@@ -1,6 +1,7 @@
 mod agents;
 mod board;
 mod cli;
+mod help;
 mod ops;
 mod repl;
 mod tui;
@@ -27,8 +28,12 @@ fn find_repo_root() -> Result<PathBuf> {
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
-        Some("-h") | Some("--help") | Some("help") => {
+        Some("-h") | Some("--help") => {
             println!("{}", cli::HELP);
+            Ok(())
+        }
+        Some("help") => {
+            help::print(&args[1..]);
             Ok(())
         }
         Some("-V") | Some("--version") => {
