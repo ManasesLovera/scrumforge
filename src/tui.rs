@@ -5,10 +5,18 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap};
 use ratatui::Frame;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{mpsc, Arc};
+use std::time::Duration;
 
+use crate::agents;
 use crate::board::{Board, Status};
 use crate::help;
 use crate::ops;
+
+/// How long we block waiting for a key before looping. Also the spinner's frame
+/// rate and the worst-case delay before a shutdown signal is noticed.
+const TICK: Duration = Duration::from_millis(100);
 
 type StatusPred = fn(&Status) -> bool;
 const COLUMNS: &[(&str, StatusPred)] = &[
@@ -34,52 +42,93 @@ enum Action {
     Rework(u32),
 }
 
+/// An agent operation running on a worker thread. Agents shell out to
+/// `opencode`, `git` and `gh` and routinely take minutes, so they must never run
+/// on the UI thread — a blocked loop cannot redraw, cannot read keys, and cannot
+/// be interrupted.
+struct Job {
+    label: String,
+    rx: mpsc::Receiver<Result<String>>,
+    frame: usize,
+    cancelling: bool,
+}
+
 struct App {
     board: Board,
     col: usize,
     list_states: Vec<ListState>,
     mode: Mode,
     message: String,
-    busy: Option<String>,
-    pending: Option<Action>,
+    job: Option<Job>,
     quit: bool,
 }
 
+/// Restores the terminal on the way out, however we leave: normal return, `?`,
+/// or panic. Without this, an abnormal exit strands the terminal in raw mode
+/// inside the alternate screen.
+struct TerminalGuard;
+
+impl Drop for TerminalGuard {
+    fn drop(&mut self) {
+        ratatui::restore();
+    }
+}
+
+/// Flag set by SIGINT/SIGTERM/SIGHUP so the event loop can shut down cleanly
+/// and let [`TerminalGuard`] run. A second signal takes the default action
+/// instead, so a wedged UI can still be killed.
+fn install_signal_handlers() -> Result<Arc<AtomicBool>> {
+    let shutdown = Arc::new(AtomicBool::new(false));
+    for sig in [
+        signal_hook::consts::SIGINT,
+        signal_hook::consts::SIGTERM,
+        signal_hook::consts::SIGHUP,
+    ] {
+        signal_hook::flag::register_conditional_shutdown(sig, 1, Arc::clone(&shutdown))?;
+        signal_hook::flag::register(sig, Arc::clone(&shutdown))?;
+    }
+    Ok(shutdown)
+}
+
 pub fn run(board: Board) -> Result<()> {
+    let shutdown = install_signal_handlers()?;
     let mut terminal = ratatui::init();
+    let _guard = TerminalGuard;
     let mut app = App {
         list_states: COLUMNS.iter().map(|_| ListState::default()).collect(),
         board,
         col: 0,
         mode: Mode::Normal,
         message: String::new(),
-        busy: None,
-        pending: None,
+        job: None,
         quit: false,
     };
     app.fix_selection();
-    let res = event_loop(&mut terminal, &mut app);
-    ratatui::restore();
-    res
+    event_loop(&mut terminal, &mut app, &shutdown)
 }
 
 fn event_loop(
     terminal: &mut ratatui::DefaultTerminal,
     app: &mut App,
+    shutdown: &Arc<AtomicBool>,
 ) -> Result<()> {
     while !app.quit {
         terminal.draw(|f| draw(f, app))?;
-        if let Some(action) = app.pending.take() {
-            app.execute(action);
-            continue;
+        if shutdown.load(Ordering::Relaxed) {
+            app.quit = true;
+            break;
         }
-        if let Event::Key(key) = event::read()? {
-            if key.kind != KeyEventKind::Press {
-                continue;
-            }
+        if event::poll(TICK)?
+            && let Event::Key(key) = event::read()?
+            && key.kind == KeyEventKind::Press
+        {
             app.handle_key(key.code, key.modifiers);
         }
+        app.poll_job();
     }
+    // Never leave an agent — or the tools it spawned — running after we exit.
+    app.cancel_job();
+    app.await_cancelled_job();
     Ok(())
 }
 
@@ -136,27 +185,118 @@ impl App {
         ls.select(Some(i.clamp(0, n as i32 - 1) as usize));
     }
 
-    fn start_busy(&mut self, msg: &str) {
-        self.busy = Some(msg.to_string());
-    }
-
     fn finish(&mut self, msg: String) {
-        self.busy = None;
+        self.job = None;
         self.message = msg;
         self.fix_selection();
     }
 
-    fn execute(&mut self, action: Action) {
-        let res = match action {
-            Action::Request(text) => ops::request(&mut self.board, &text).map(|l| l.join("\n")),
-            Action::Run(id) => ops::run_task(&mut self.board, id),
-            Action::Rework(id) => ops::rework(&mut self.board, id),
+    /// Hand `action` to a worker thread and show the busy overlay. The worker
+    /// opens its own board connection — `rusqlite::Connection` cannot cross
+    /// threads — and writes to the same file, which the UI re-reads each frame.
+    fn start_job(&mut self, label: String, action: Action) {
+        if self.job.is_some() {
+            self.message = "an agent is already running".into();
+            return;
+        }
+        let db_path = self.board.db_path.clone();
+        let repo_path = self.board.repo_path.clone();
+        let (tx, rx) = mpsc::channel();
+        agents::reset_cancel();
+        std::thread::spawn(move || {
+            let res = Board::open(&db_path, repo_path).and_then(|mut board| match action {
+                Action::Request(text) => ops::request(&mut board, &text).map(|l| l.join("\n")),
+                Action::Run(id) => ops::run_task(&mut board, id),
+                Action::Rework(id) => ops::rework(&mut board, id),
+            });
+            let _ = tx.send(res);
+        });
+        self.job = Some(Job {
+            label,
+            rx,
+            frame: 0,
+            cancelling: false,
+        });
+    }
+
+    /// Advance the spinner and collect the worker's result if it has finished.
+    fn poll_job(&mut self) {
+        let Some(job) = self.job.as_mut() else {
+            return;
         };
-        self.finish(res.unwrap_or_else(|e| format!("error: {e:#}")));
+        job.frame = job.frame.wrapping_add(1);
+        let cancelling = job.cancelling;
+        let outcome = match job.rx.try_recv() {
+            Ok(res) => Some(match res {
+                Ok(msg) => msg,
+                Err(e) => format!("error: {e:#}"),
+            }),
+            Err(mpsc::TryRecvError::Empty) => None,
+            Err(mpsc::TryRecvError::Disconnected) => Some("agent stopped unexpectedly".into()),
+        };
+        if let Some(msg) = outcome {
+            let msg = if cancelling { "cancelled".into() } else { msg };
+            self.finish(msg);
+        }
+    }
+
+    /// Kill the running agent and the subprocess tree under it.
+    fn cancel_job(&mut self) {
+        if let Some(job) = self.job.as_mut() {
+            if job.cancelling {
+                return;
+            }
+            job.cancelling = true;
+            job.label = "cancelling…".into();
+            agents::cancel();
+        }
+    }
+
+    /// Give a cancelled worker a moment to unwind so its board write is not cut
+    /// off mid-flight. Bounded, so a stuck agent cannot hold the exit hostage.
+    fn await_cancelled_job(&mut self) {
+        let Some(job) = self.job.as_ref() else {
+            return;
+        };
+        let _ = job.rx.recv_timeout(Duration::from_secs(2));
+        self.job = None;
+    }
+
+    /// Start the agent for `id`, if a task is selected.
+    fn run_selected(&mut self) {
+        if let Some(id) = self.selected_id() {
+            let who = self
+                .board
+                .get(id)
+                .and_then(|t| t.assignee.clone())
+                .unwrap_or_else(|| "developer".into());
+            self.start_job(format!("{who} working on task #{id}…"), Action::Run(id));
+        } else {
+            self.message = "no task selected".into();
+        }
+    }
+
+    fn rework_selected(&mut self) {
+        if let Some(id) = self.selected_id() {
+            self.start_job(
+                format!("developer reworking task #{id}…"),
+                Action::Rework(id),
+            );
+        } else {
+            self.message = "no task selected".into();
+        }
     }
 
     fn handle_key(&mut self, code: KeyCode, mods: KeyModifiers) {
-        if code == KeyCode::Char('c') && mods.contains(KeyModifiers::CONTROL) {
+        let ctrl_c = code == KeyCode::Char('c') && mods.contains(KeyModifiers::CONTROL);
+        // While an agent runs, the only meaningful keys are the ones that stop it.
+        if self.job.is_some() {
+            if ctrl_c || code == KeyCode::Esc {
+                self.cancel_job();
+            }
+            return;
+        }
+        if ctrl_c {
             self.quit = true;
             return;
         }
@@ -164,23 +304,8 @@ impl App {
             Mode::Task => {
                 self.mode = Mode::Normal;
                 match code {
-                    KeyCode::Char('r') => {
-                        if let Some(id) = self.selected_id() {
-                            let who = self
-                                .board
-                                .get(id)
-                                .and_then(|t| t.assignee.clone())
-                                .unwrap_or_else(|| "developer".into());
-                            self.start_busy(&format!("{who} working on task #{id}…"));
-                            self.pending = Some(Action::Run(id));
-                        }
-                    }
-                    KeyCode::Char('w') => {
-                        if let Some(id) = self.selected_id() {
-                            self.start_busy(&format!("developer reworking task #{id}…"));
-                            self.pending = Some(Action::Rework(id));
-                        }
-                    }
+                    KeyCode::Char('r') => self.run_selected(),
+                    KeyCode::Char('w') => self.rework_selected(),
                     KeyCode::Char('v') => {
                         self.mode = Mode::Command {
                             prompt: "review: ".into(),
@@ -238,25 +363,8 @@ impl App {
                         self.message = "no task selected".into();
                     }
                 }
-                KeyCode::Char('r') => {
-                    if let Some(id) = self.selected_id() {
-                        let who = self
-                            .board
-                            .get(id)
-                            .and_then(|t| t.assignee.clone())
-                            .unwrap_or_else(|| "developer".into());
-                        self.start_busy(&format!("{who} working on task #{id}…"));
-                        self.pending = Some(Action::Run(id));
-                    } else {
-                        self.message = "no task selected".into();
-                    }
-                }
-                KeyCode::Char('w') => {
-                    if let Some(id) = self.selected_id() {
-                        self.start_busy(&format!("developer reworking task #{id}…"));
-                        self.pending = Some(Action::Rework(id));
-                    }
-                }
+                KeyCode::Char('r') => self.run_selected(),
+                KeyCode::Char('w') => self.rework_selected(),
                 KeyCode::Char('v') => {
                     if self.selected_id().is_some() {
                         self.mode = Mode::Command {
@@ -287,8 +395,10 @@ impl App {
             }
             "add: " => ops::add_backlog_task(&mut self.board, line),
             "request: " => {
-                self.start_busy("scrum master is planning…");
-                self.pending = Some(Action::Request(line.to_string()));
+                self.start_job(
+                    "scrum master is planning…".into(),
+                    Action::Request(line.to_string()),
+                );
                 return;
             }
             _ => {
@@ -296,16 +406,17 @@ impl App {
                 match cmd {
                     "run" => match rest.parse::<u32>() {
                         Ok(id) => {
-                            self.start_busy(&format!("working on task #{id}…"));
-                            self.pending = Some(Action::Run(id));
+                            self.start_job(format!("working on task #{id}…"), Action::Run(id));
                             return;
                         }
                         Err(_) => Err(anyhow::anyhow!("usage: run <id>")),
                     },
                     "rework" => match rest.parse::<u32>() {
                         Ok(id) => {
-                            self.start_busy(&format!("developer reworking task #{id}…"));
-                            self.pending = Some(Action::Rework(id));
+                            self.start_job(
+                                format!("developer reworking task #{id}…"),
+                                Action::Rework(id),
+                            );
                             return;
                         }
                         Err(_) => Err(anyhow::anyhow!("usage: rework <id>")),
@@ -368,8 +479,8 @@ fn draw(f: &mut Frame, app: &mut App) {
     draw_detail(f, app, detail);
     draw_footer(f, app, footer);
 
-    if let Some(busy) = &app.busy {
-        draw_busy(f, busy);
+    if let Some(job) = &app.job {
+        draw_busy(f, job);
     }
     if let Mode::Help = app.mode {
         draw_help(f);
@@ -469,6 +580,20 @@ fn draw_detail(f: &mut Frame, app: &App, area: Rect) {
 }
 
 fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
+    if let Some(job) = &app.job {
+        let line = Line::from(vec![
+            Span::styled("Esc", Style::default().fg(Color::Red).bold()),
+            Span::raw(" or "),
+            Span::styled("Ctrl-C", Style::default().fg(Color::Red).bold()),
+            Span::raw(if job.cancelling {
+                "  │ stopping…"
+            } else {
+                "  │ cancel the running agent"
+            }),
+        ]);
+        f.render_widget(Paragraph::new(line).wrap(Wrap { trim: false }), area);
+        return;
+    }
     let line = match &app.mode {
         Mode::Command { prompt, input } => Line::from(vec![
             Span::styled(prompt.clone(), Style::default().fg(Color::Cyan).bold()),
@@ -482,10 +607,14 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
             Span::raw("dd  "),
             Span::styled("r", Style::default().fg(Color::Green).bold()),
             Span::raw("un  "),
+            // 'w' and 'v' sit mid-word; highlight them in place rather than
+            // prefixing, which rendered as "wrework" / "vreview".
+            Span::raw("re"),
             Span::styled("w", Style::default().fg(Color::Green).bold()),
-            Span::raw("rework  "),
+            Span::raw("ork  "),
+            Span::raw("re"),
             Span::styled("v", Style::default().fg(Color::Green).bold()),
-            Span::raw("review  "),
+            Span::raw("iew  "),
             Span::styled(":", Style::default().fg(Color::Green).bold()),
             Span::raw("cmd  "),
             Span::styled("?", Style::default().fg(Color::Green).bold()),
@@ -501,20 +630,46 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
     );
 }
 
-fn draw_busy(f: &mut Frame, msg: &str) {
-    let area = centered(f.area(), 50, 20);
-    let spinner = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏";
-    let frame_char = spinner.chars().next().unwrap_or('*');
-    let text = Line::from(vec![
-        Span::styled(format!("{frame_char} "), Style::default().fg(Color::Cyan).bold()),
-        Span::styled(msg, Style::default().add_modifier(Modifier::BOLD)),
-        Span::styled("\n(agents can take minutes — Ctrl-C aborts)", Style::default().fg(Color::DarkGray)),
-    ]);
+const SPINNER: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+
+fn draw_busy(f: &mut Frame, job: &Job) {
+    let frame_char = SPINNER[job.frame % SPINNER.len()];
+    let hint = if job.cancelling {
+        "stopping the agent and its subprocesses…"
+    } else {
+        "agents can take minutes · Esc or Ctrl-C to cancel"
+    };
+    // Separate `Line`s, not "\n" inside a Span: ratatui renders a Span as a
+    // single run of cells, so an embedded newline is swallowed and the tail of
+    // the text runs on past the edge of the box.
+    let lines = vec![
+        Line::from(vec![
+            Span::styled(
+                format!("{frame_char} "),
+                Style::default().fg(Color::Cyan).bold(),
+            ),
+            Span::styled(job.label.clone(), Style::default().add_modifier(Modifier::BOLD)),
+        ]),
+        "".into(),
+        Line::from(Span::styled(hint, Style::default().fg(Color::DarkGray))),
+    ];
+
+    // Size to the content so the hint can never be clipped mid-sentence.
+    let width = lines.iter().map(Line::width).max().unwrap_or(0) as u16 + 4;
+    let height = lines.len() as u16 + 2;
+    let area = centered_size(f.area(), width, height);
+
     f.render_widget(Clear, area);
     f.render_widget(
-        Paragraph::new(text)
+        Paragraph::new(lines)
             .centered()
-            .block(Block::default().borders(Borders::ALL).title(" ⚙ working ").border_style(Style::default().fg(Color::Cyan))),
+            .wrap(Wrap { trim: false })
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(" ⚙ working ")
+                    .border_style(Style::default().fg(Color::Cyan)),
+            ),
         area,
     );
 }
@@ -685,4 +840,74 @@ mod tests {
             assert!(rendered.contains(desc), "truncated at 80x24:\n{rendered}");
         }
     }
+
+    fn render_busy(job: &Job, width: u16, height: u16) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal.draw(|f| draw_busy(f, job)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol().to_string())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn dummy_job(frame: usize, cancelling: bool) -> Job {
+        // The sender is dropped immediately; nothing here polls the channel.
+        let (_, rx) = mpsc::channel();
+        Job {
+            label: "developer working on task #1…".into(),
+            rx,
+            frame,
+            cancelling,
+        }
+    }
+
+    /// The cancel hint used to live in a `"\n(…)"` span, which ratatui renders as
+    /// one unbroken run — the sentence ran off the box and was clipped mid-word.
+    /// It must appear whole, on its own line, at the sizes we support.
+    #[test]
+    fn busy_overlay_shows_the_whole_cancel_hint() {
+        for (w, h) in [(120, 30), (80, 24), (60, 12)] {
+            let rendered = render_busy(&dummy_job(0, false), w, h);
+            assert!(
+                rendered.contains("Esc or Ctrl-C to cancel"),
+                "cancel hint clipped at {w}x{h}:\n{rendered}"
+            );
+            assert!(
+                rendered.contains("developer working on task #1…"),
+                "label clipped at {w}x{h}:\n{rendered}"
+            );
+        }
+    }
+
+    /// The spinner is driven by the job's frame counter; a fixed frame meant the
+    /// overlay looked frozen even while the agent was making progress.
+    #[test]
+    fn busy_overlay_spinner_advances_with_the_frame_counter() {
+        let seen: std::collections::HashSet<char> = (0..SPINNER.len())
+            .map(|frame| {
+                let rendered = render_busy(&dummy_job(frame, false), 80, 24);
+                *SPINNER
+                    .iter()
+                    .find(|c| rendered.contains(**c))
+                    .expect("no spinner glyph rendered")
+            })
+            .collect();
+        assert_eq!(seen.len(), SPINNER.len(), "spinner does not animate");
+    }
+
+    /// Cancelling swaps the hint, so the user knows the keypress registered.
+    #[test]
+    fn busy_overlay_reports_cancellation() {
+        let rendered = render_busy(&dummy_job(0, true), 80, 24);
+        assert!(
+            rendered.contains("stopping the agent"),
+            "no cancellation feedback:\n{rendered}"
+        );
+    }
 }
+

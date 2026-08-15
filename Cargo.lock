@@ -1282,10 +1282,12 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "crossterm",
+ "libc",
  "ratatui",
  "rusqlite",
  "rustyline",
  "serde_json",
+ "signal-hook",
 ]
 
 [[package]]

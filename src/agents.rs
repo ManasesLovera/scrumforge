@@ -1,9 +1,68 @@
 use anyhow::{bail, Context, Result};
 use serde_json::Value;
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Output, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Mutex;
 
 use crate::board::{Board, Status, Task};
+
+/// PID of the subprocess currently running, if any. Each child gets its own
+/// process group, so cancelling can take down the whole tree — agents spawn
+/// helpers of their own, and killing only the parent would orphan them.
+static CURRENT_CHILD: Mutex<Option<i32>> = Mutex::new(None);
+
+/// Set while a cancel is in flight, so the *next* step of a multi-command
+/// operation refuses to start rather than racing past the kill.
+static CANCELLED: AtomicBool = AtomicBool::new(false);
+
+/// Arm cancellation for a fresh operation. Call before starting one.
+pub fn reset_cancel() {
+    CANCELLED.store(false, Ordering::SeqCst);
+}
+
+/// Kill the running subprocess tree, if any, and make later steps of the same
+/// operation bail out instead of continuing.
+pub fn cancel() {
+    CANCELLED.store(true, Ordering::SeqCst);
+    let pgid = CURRENT_CHILD.lock().ok().and_then(|g| *g);
+    if let Some(pgid) = pgid {
+        // Safety: `pgid` names a process group we created via `process_group(0)`.
+        // A stale pgid is harmless here — killpg just reports ESRCH.
+        unsafe { libc::killpg(pgid, libc::SIGKILL) };
+    }
+}
+
+/// Run `cmd` to completion with its output captured, tracked so [`cancel`] can
+/// kill it mid-flight.
+///
+/// stdin is `/dev/null` deliberately: the TUI holds the terminal in raw mode, and
+/// a child that inherited stdin would swallow the user's keystrokes.
+fn output_tracked(cmd: &mut Command) -> Result<Output> {
+    if CANCELLED.load(Ordering::SeqCst) {
+        bail!("cancelled");
+    }
+    let child = cmd
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .process_group(0)
+        .spawn()?;
+    if let Ok(mut slot) = CURRENT_CHILD.lock() {
+        *slot = Some(child.id() as i32);
+    }
+    let waited = child.wait_with_output();
+    if let Ok(mut slot) = CURRENT_CHILD.lock() {
+        *slot = None;
+    }
+    let out = waited?;
+    // A killed child looks like an ordinary failure; report the real reason.
+    if CANCELLED.load(Ordering::SeqCst) {
+        bail!("cancelled");
+    }
+    Ok(out)
+}
 
 /// Run a non-interactive opencode agent turn in `workdir` and return its text reply.
 pub fn ask_agent(role: &str, workdir: &Path, prompt: &str) -> Result<String> {
@@ -11,12 +70,9 @@ pub fn ask_agent(role: &str, workdir: &Path, prompt: &str) -> Result<String> {
         "You are the {role} on a scrum team. Reply with a single JSON object, \
          no markdown fences, no extra text. {prompt}"
     );
-    let out = Command::new("opencode")
-        .arg("run")
-        .arg(&full_prompt)
-        .current_dir(workdir)
-        .output()
-        .context("spawning opencode")?;
+    let mut cmd = Command::new("opencode");
+    cmd.arg("run").arg(&full_prompt).current_dir(workdir);
+    let out = output_tracked(&mut cmd).context("spawning opencode")?;
     if !out.status.success() {
         bail!(
             "opencode failed ({}): {}",
@@ -57,11 +113,9 @@ fn home_dir() -> PathBuf {
 }
 
 fn run(cmd: &str, args: &[&str], dir: &Path) -> Result<String> {
-    let out = Command::new(cmd)
-        .args(args)
-        .current_dir(dir)
-        .output()
-        .with_context(|| format!("running {cmd}"))?;
+    let mut command = Command::new(cmd);
+    command.args(args).current_dir(dir);
+    let out = output_tracked(&mut command).with_context(|| format!("running {cmd}"))?;
     if !out.status.success() {
         bail!(
             "{cmd} {} failed ({}): {}",
