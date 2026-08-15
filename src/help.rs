@@ -94,27 +94,53 @@ COMMANDS
     scrumforge --version       print the version
 ";
 
-const TUI: &str = "\
-TUI
-    Columns are the statuses; each card is a task.
+/// TUI key bindings. Rendered as prose by `help tui` and as the in-app `?`
+/// overlay ([`crate::tui`]), so the two can never drift apart. Keep the
+/// descriptions short enough to fit the overlay box.
+pub const KEYS: &[(&str, &str)] = &[
+    ("←/h →/l", "select column"),
+    ("↑/k ↓/j", "select task"),
+    ("Enter", "open task modal (r run, w rework, v review)"),
+    ("r", "send task to its assignee"),
+    ("w", "developer reworks after changes requested"),
+    ("v", "review: send task back in progress with feedback"),
+    ("R", "ask scrum master to plan a request"),
+    ("a", "add a backlog task (\"title\" | \"desc\")"),
+    (":", "command mode (run, rework, assign, review, quit)"),
+    ("? / F1", "this help"),
+    ("q", "quit (Esc closes modals)"),
+];
 
-      hjkl / arrows   move between columns and tasks
-      Enter           open the selected task in a modal
-                      (inside it: `r` run, `w` rework, `v` review, Esc close)
-      r               run the selected task (send it to its assignee)
-      w               rework the selected task after changes were requested
-      v               review: type feedback, task goes back in-progress
-      R               ask the scrum master to plan a request
-      a               add a backlog task (`title | description`)
-      :               command mode — run 3, rework 3, assign 3 reviewer,
-                      review 3 <feedback>, quit
-      ?  or  F1       help overlay
-      q               quit; Esc closes a modal, overlay, or prompt
+/// The board flow, as shown in the `?` overlay.
+pub const FLOW: &[&str] = &[
+    "request → assigned → run → in-review → run (reviewer)",
+    "  → merged ✓   or changes-requested → w → in-review …",
+];
 
-    Agent turns take minutes. While one runs, a busy overlay is shown and
-    Ctrl-C aborts it; board state is written after each step, so an aborted
-    run leaves the task where it got to rather than losing it.
-";
+/// Caveats worth repeating wherever the keys are shown.
+pub const TUI_NOTES: &[&str] = &[
+    "agent turns take minutes; Ctrl-C aborts a running one",
+    "board state is saved after each step",
+];
+
+/// Column width for the key names in both renderings.
+pub const KEY_WIDTH: usize = 9;
+
+fn tui() -> String {
+    let mut s = String::from("TUI\n    Columns are the statuses; each card is a task.\n\n");
+    for (key, desc) in KEYS {
+        s.push_str(&format!("      {key:<width$} {desc}\n", width = KEY_WIDTH));
+    }
+    s.push_str("\n    Flow:\n");
+    for line in FLOW {
+        s.push_str(&format!("      {line}\n"));
+    }
+    s.push('\n');
+    for note in TUI_NOTES {
+        s.push_str(&format!("    - {note}\n"));
+    }
+    s
+}
 
 const REPL: &str = "\
 REPL
@@ -176,19 +202,23 @@ REQUIREMENTS
     Run from anywhere inside the repository; the root is found automatically.
 ";
 
-const TOPICS: &[(&str, &str)] = &[
-    ("overview", OVERVIEW),
-    ("lifecycle", LIFECYCLE),
-    ("commands", CLI),
-    ("tui", TUI),
-    ("repl", REPL),
-    ("agents", AGENTS),
-    ("files", FILES),
-    ("requirements", REQUIREMENTS),
+/// A topic body: either a fixed block of prose, or one rendered from the
+/// structured data the TUI also draws from.
+type Body = fn() -> String;
+
+const TOPICS: &[(&str, Body)] = &[
+    ("overview", || OVERVIEW.to_string()),
+    ("lifecycle", || LIFECYCLE.to_string()),
+    ("commands", || CLI.to_string()),
+    ("tui", tui),
+    ("repl", || REPL.to_string()),
+    ("agents", || AGENTS.to_string()),
+    ("files", || FILES.to_string()),
+    ("requirements", || REQUIREMENTS.to_string()),
 ];
 
 /// Aliases so `help cli`, `help board`, `help status` etc. land somewhere sane.
-fn resolve(topic: &str) -> Option<&'static str> {
+fn resolve(topic: &str) -> Option<Body> {
     let topic = topic.trim().to_ascii_lowercase();
     let canonical = match topic.as_str() {
         "cli" | "command" | "commands" => "commands",
@@ -205,6 +235,15 @@ fn resolve(topic: &str) -> Option<&'static str> {
         .map(|(_, body)| *body)
 }
 
+/// Every topic, rendered end to end.
+fn all() -> String {
+    TOPICS
+        .iter()
+        .map(|(_, body)| body())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// Print the full guide, or one topic when `args` names one.
 pub fn print(args: &[String]) {
     println!(
@@ -214,7 +253,7 @@ pub fn print(args: &[String]) {
 
     if let Some(topic) = args.first() {
         match resolve(topic) {
-            Some(body) => print!("{body}"),
+            Some(body) => print!("{}", body()),
             None => {
                 let names: Vec<&str> = TOPICS.iter().map(|(n, _)| *n).collect();
                 println!("unknown help topic: {topic}");
@@ -224,10 +263,5 @@ pub fn print(args: &[String]) {
         return;
     }
 
-    for (i, (_, body)) in TOPICS.iter().enumerate() {
-        if i > 0 {
-            println!();
-        }
-        print!("{body}");
-    }
+    print!("{}", all());
 }

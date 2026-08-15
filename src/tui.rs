@@ -7,6 +7,7 @@ use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragra
 use ratatui::Frame;
 
 use crate::board::{Board, Status};
+use crate::help;
 use crate::ops;
 
 type StatusPred = fn(&Status) -> bool;
@@ -569,33 +570,63 @@ fn draw_task_modal(f: &mut Frame, app: &App) {
     );
 }
 
+/// The `?` overlay. Keys, flow, and notes come from [`crate::help`] — the same
+/// source `scrumforge help tui` prints — so the two cannot drift apart.
 fn draw_help(f: &mut Frame) {
-    let area = centered(f.area(), 60, 50);
-    let help = vec![
-        Line::from(Span::styled("keys", Style::default().fg(Color::Cyan).bold())),
-        " ←/h →/l   select column".into(),
-        " ↑/k ↓/j   select task".into(),
-        " Enter     open selected task (Esc closes)".into(),
-        " r         send task to its assignee".into(),
-        " w         developer reworks after changes requested".into(),
-        " v         review: send task back in progress with feedback".into(),
-        " R         ask scrum master to plan a request".into(),
-        " a         add a backlog task (\"title\" | \"desc\")".into(),
-        " :         command mode (run/rework/assign/quit…)".into(),
-        " q         quit (Esc closes modals)".into(),
-        "".into(),
-        Line::from(Span::styled("flow", Style::default().fg(Color::Cyan).bold())),
-        " request → assigned → run → in-review → run (reviewer)".into(),
-        "   → merged ✓   or changes-requested → w → in-review …".into(),
-        "".into(),
-        Line::from(Span::styled("press any key to close", Style::default().fg(Color::DarkGray))),
-    ];
+    let heading = |text: &'static str| Line::from(Span::styled(text, Style::default().fg(Color::Cyan).bold()));
+
+    let mut lines = vec![heading("keys")];
+    lines.extend(help::KEYS.iter().map(|(key, desc)| {
+        Line::from(vec![
+            Span::styled(
+                format!(" {key:<width$} ", width = help::KEY_WIDTH),
+                Style::default().fg(Color::Yellow),
+            ),
+            Span::raw(*desc),
+        ])
+    }));
+
+    lines.push("".into());
+    lines.push(heading("flow"));
+    lines.extend(help::FLOW.iter().map(|l| Line::from(format!(" {l}"))));
+
+    lines.push("".into());
+    lines.extend(help::TUI_NOTES.iter().map(|n| {
+        Line::from(Span::styled(format!(" {n}"), Style::default().fg(Color::DarkGray)))
+    }));
+
+    lines.push("".into());
+    lines.push(Line::from(Span::styled(
+        " press any key to close · full guide: scrumforge help",
+        Style::default().fg(Color::DarkGray),
+    )));
+
+    // Size to the content rather than a percentage, so no binding gets wrapped
+    // or clipped on a narrow terminal; Wrap is only the fallback for terminals
+    // too small even for that.
+    let width = lines.iter().map(Line::width).max().unwrap_or(0) as u16 + 2;
+    let height = lines.len() as u16 + 2;
+    let area = centered_size(f.area(), width, height);
+
     f.render_widget(Clear, area);
     f.render_widget(
-        Paragraph::new(help)
+        Paragraph::new(lines)
+            .wrap(Wrap { trim: false })
             .block(Block::default().borders(Borders::ALL).title(" help ")),
         area,
     );
+}
+
+/// A `width` x `height` rect centred in `area`, shrunk to fit if it is bigger.
+fn centered_size(area: Rect, width: u16, height: u16) -> Rect {
+    let width = width.min(area.width);
+    let height = height.min(area.height);
+    Rect {
+        x: area.x + (area.width - width) / 2,
+        y: area.y + (area.height - height) / 2,
+        width,
+        height,
+    }
 }
 
 fn centered(area: Rect, pct_x: u16, pct_y: u16) -> Rect {
@@ -609,5 +640,49 @@ fn centered(area: Rect, pct_x: u16, pct_y: u16) -> Rect {
         y: area.y + dy,
         width: inner.width,
         height: inner.height,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    fn render_help(width: u16, height: u16) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal.draw(draw_help).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol().to_string())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// The overlay must show every binding help.rs defines, so adding one there
+    /// cannot leave the TUI out of date.
+    #[test]
+    fn help_overlay_renders_every_key_from_help_module() {
+        let rendered = render_help(120, 40);
+        for (key, desc) in help::KEYS {
+            assert!(rendered.contains(key), "missing key {key} in overlay:\n{rendered}");
+            assert!(rendered.contains(desc), "missing desc {desc} in overlay:\n{rendered}");
+        }
+        for line in help::FLOW {
+            assert!(rendered.contains(line), "missing flow line in overlay:\n{rendered}");
+        }
+    }
+
+    /// Nothing may be truncated at the smallest terminal we expect to run in.
+    #[test]
+    fn help_overlay_fits_an_80x24_terminal() {
+        let rendered = render_help(80, 24);
+        for (_, desc) in help::KEYS {
+            assert!(rendered.contains(desc), "truncated at 80x24:\n{rendered}");
+        }
     }
 }
