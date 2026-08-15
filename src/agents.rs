@@ -17,6 +17,16 @@ static CURRENT_CHILD: Mutex<Option<i32>> = Mutex::new(None);
 /// operation refuses to start rather than racing past the kill.
 static CANCELLED: AtomicBool = AtomicBool::new(false);
 
+/// The error message a cancelled step fails with. [`was_cancelled`] matches on
+/// it, so the UI can tell a real cancellation from a result that happened to
+/// arrive first.
+pub const CANCEL_MSG: &str = "cancelled";
+
+/// Whether `err` came from a cancelled step rather than a genuine failure.
+pub fn was_cancelled(err: &anyhow::Error) -> bool {
+    err.chain().any(|c| c.to_string() == CANCEL_MSG)
+}
+
 /// Arm cancellation for a fresh operation. Call before starting one.
 pub fn reset_cancel() {
     CANCELLED.store(false, Ordering::SeqCst);
@@ -26,12 +36,24 @@ pub fn reset_cancel() {
 /// operation bail out instead of continuing.
 pub fn cancel() {
     CANCELLED.store(true, Ordering::SeqCst);
-    let pgid = CURRENT_CHILD.lock().ok().and_then(|g| *g);
+    // Taking the lock blocks until any in-flight spawn has registered its pid,
+    // so a child started a moment ago cannot escape the kill.
+    let pgid = *lock_child();
     if let Some(pgid) = pgid {
-        // Safety: `pgid` names a process group we created via `process_group(0)`.
-        // A stale pgid is harmless here — killpg just reports ESRCH.
-        unsafe { libc::killpg(pgid, libc::SIGKILL) };
+        kill_group(pgid);
     }
+}
+
+/// The child registry, ignoring poisoning: a panicking worker must not make the
+/// remaining ones unkillable.
+fn lock_child() -> std::sync::MutexGuard<'static, Option<i32>> {
+    CURRENT_CHILD.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+fn kill_group(pgid: i32) {
+    // Safety: `pgid` names a process group we created via `process_group(0)`.
+    // A stale pgid is harmless here — killpg just reports ESRCH.
+    unsafe { libc::killpg(pgid, libc::SIGKILL) };
 }
 
 /// Run `cmd` to completion with its output captured, tracked so [`cancel`] can
@@ -41,25 +63,34 @@ pub fn cancel() {
 /// a child that inherited stdin would swallow the user's keystrokes.
 fn output_tracked(cmd: &mut Command) -> Result<Output> {
     if CANCELLED.load(Ordering::SeqCst) {
-        bail!("cancelled");
+        bail!("{CANCEL_MSG}");
     }
-    let child = cmd
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .process_group(0)
-        .spawn()?;
-    if let Ok(mut slot) = CURRENT_CHILD.lock() {
-        *slot = Some(child.id() as i32);
-    }
+    // Spawn and register under one lock. If they were separate steps, a cancel
+    // landing in between would find an empty slot, kill nothing, and leave us
+    // blocked in `wait_with_output` until the agent finished on its own.
+    let child = {
+        let mut slot = lock_child();
+        let child = cmd
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .process_group(0)
+            .spawn()?;
+        let pgid = child.id() as i32;
+        *slot = Some(pgid);
+        // The check at the top of this function raced too: cancel may have set
+        // the flag and taken the lock before us, finding nothing to kill.
+        if CANCELLED.load(Ordering::SeqCst) {
+            kill_group(pgid);
+        }
+        child
+    };
     let waited = child.wait_with_output();
-    if let Ok(mut slot) = CURRENT_CHILD.lock() {
-        *slot = None;
-    }
+    *lock_child() = None;
     let out = waited?;
     // A killed child looks like an ordinary failure; report the real reason.
     if CANCELLED.load(Ordering::SeqCst) {
-        bail!("cancelled");
+        bail!("{CANCEL_MSG}");
     }
     Ok(out)
 }

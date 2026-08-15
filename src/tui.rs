@@ -18,6 +18,9 @@ use crate::ops;
 /// rate and the worst-case delay before a shutdown signal is noticed.
 const TICK: Duration = Duration::from_millis(100);
 
+/// How long a cancelled worker gets to unwind before we exit without it.
+const SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
+
 type StatusPred = fn(&Status) -> bool;
 const COLUMNS: &[(&str, StatusPred)] = &[
     ("Backlog", |s| matches!(s, Status::Backlog)),
@@ -92,26 +95,38 @@ fn install_signal_handlers() -> Result<Arc<AtomicBool>> {
 
 pub fn run(board: Board) -> Result<()> {
     let shutdown = install_signal_handlers()?;
-    let mut terminal = ratatui::init();
-    let _guard = TerminalGuard;
-    let mut app = App {
-        list_states: COLUMNS.iter().map(|_| ListState::default()).collect(),
-        board,
-        col: 0,
-        mode: Mode::Normal,
-        message: String::new(),
-        job: None,
-        quit: false,
+    let abandoned = {
+        let mut terminal = ratatui::init();
+        let _guard = TerminalGuard;
+        let mut app = App {
+            list_states: COLUMNS.iter().map(|_| ListState::default()).collect(),
+            board,
+            col: 0,
+            mode: Mode::Normal,
+            message: String::new(),
+            job: None,
+            quit: false,
+        };
+        app.fix_selection();
+        event_loop(&mut terminal, &mut app, &shutdown)?
     };
-    app.fix_selection();
-    event_loop(&mut terminal, &mut app, &shutdown)
+    // Printed after the guard has restored the terminal, so it lands in the
+    // user's shell rather than on the alternate screen we are tearing down.
+    if abandoned {
+        eprintln!(
+            "warning: an agent did not stop in time and was left running; \
+             check for stray `opencode`, `git` or `gh` processes"
+        );
+    }
+    Ok(())
 }
 
+/// Runs until the user quits. Returns true if an agent outlived the loop.
 fn event_loop(
     terminal: &mut ratatui::DefaultTerminal,
     app: &mut App,
     shutdown: &Arc<AtomicBool>,
-) -> Result<()> {
+) -> Result<bool> {
     while !app.quit {
         terminal.draw(|f| draw(f, app))?;
         if shutdown.load(Ordering::Relaxed) {
@@ -128,8 +143,7 @@ fn event_loop(
     }
     // Never leave an agent — or the tools it spawned — running after we exit.
     app.cancel_job();
-    app.await_cancelled_job();
-    Ok(())
+    Ok(app.await_cancelled_job())
 }
 
 impl App {
@@ -225,17 +239,18 @@ impl App {
             return;
         };
         job.frame = job.frame.wrapping_add(1);
-        let cancelling = job.cancelling;
+        // Report what the worker actually did, not what we asked it to do: a
+        // result may already have been in the channel when Esc was pressed, and
+        // labelling a finished `request` "cancelled" invites the user to run it
+        // again and duplicate every task it just created.
         let outcome = match job.rx.try_recv() {
-            Ok(res) => Some(match res {
-                Ok(msg) => msg,
-                Err(e) => format!("error: {e:#}"),
-            }),
+            Ok(Ok(msg)) => Some(msg),
+            Ok(Err(e)) if agents::was_cancelled(&e) => Some("cancelled".into()),
+            Ok(Err(e)) => Some(format!("error: {e:#}")),
             Err(mpsc::TryRecvError::Empty) => None,
             Err(mpsc::TryRecvError::Disconnected) => Some("agent stopped unexpectedly".into()),
         };
         if let Some(msg) = outcome {
-            let msg = if cancelling { "cancelled".into() } else { msg };
             self.finish(msg);
         }
     }
@@ -254,12 +269,21 @@ impl App {
 
     /// Give a cancelled worker a moment to unwind so its board write is not cut
     /// off mid-flight. Bounded, so a stuck agent cannot hold the exit hostage.
-    fn await_cancelled_job(&mut self) {
+    ///
+    /// Returns true if it did not report back in time — we are about to exit out
+    /// from under it, and anything it spawned that survived the kill outlives us.
+    fn await_cancelled_job(&mut self) -> bool {
         let Some(job) = self.job.as_ref() else {
-            return;
+            return false;
         };
-        let _ = job.rx.recv_timeout(Duration::from_secs(2));
+        // A disconnect means the worker thread is gone, which is an orderly
+        // enough exit; only a timeout means it is still in there somewhere.
+        let abandoned = matches!(
+            job.rx.recv_timeout(SHUTDOWN_GRACE),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        );
         self.job = None;
+        abandoned
     }
 
     /// Start the agent for `id`, if a task is selected.
@@ -289,10 +313,17 @@ impl App {
 
     fn handle_key(&mut self, code: KeyCode, mods: KeyModifiers) {
         let ctrl_c = code == KeyCode::Char('c') && mods.contains(KeyModifiers::CONTROL);
-        // While an agent runs, the only meaningful keys are the ones that stop it.
-        if self.job.is_some() {
+        // While an agent runs, the only meaningful keys are the ones that stop
+        // it. Pressing them a second time leaves anyway: raw mode swallows
+        // SIGINT, so this is the user's only way out of an agent that ignores
+        // the kill, and without it the TUI cannot be quit from the keyboard.
+        if let Some(job) = self.job.as_ref() {
             if ctrl_c || code == KeyCode::Esc {
-                self.cancel_job();
+                if job.cancelling {
+                    self.quit = true;
+                } else {
+                    self.cancel_job();
+                }
             }
             return;
         }
@@ -586,7 +617,7 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
             Span::raw(" or "),
             Span::styled("Ctrl-C", Style::default().fg(Color::Red).bold()),
             Span::raw(if job.cancelling {
-                "  │ stopping…"
+                "  │ stopping… press again to quit anyway"
             } else {
                 "  │ cancel the running agent"
             }),
@@ -635,7 +666,7 @@ const SPINNER: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '�
 fn draw_busy(f: &mut Frame, job: &Job) {
     let frame_char = SPINNER[job.frame % SPINNER.len()];
     let hint = if job.cancelling {
-        "stopping the agent and its subprocesses…"
+        "stopping the agent and its subprocesses… press again to quit anyway"
     } else {
         "agents can take minutes · Esc or Ctrl-C to cancel"
     };
@@ -908,6 +939,87 @@ mod tests {
             rendered.contains("stopping the agent"),
             "no cancellation feedback:\n{rendered}"
         );
+        assert!(
+            rendered.contains("press again to quit"),
+            "no escape hatch offered:\n{rendered}"
+        );
+    }
+
+    fn test_app() -> App {
+        let board = Board::open(std::path::Path::new(":memory:"), "/tmp".into()).unwrap();
+        App {
+            list_states: COLUMNS.iter().map(|_| ListState::default()).collect(),
+            board,
+            col: 0,
+            mode: Mode::Normal,
+            message: String::new(),
+            job: None,
+            quit: false,
+        }
+    }
+
+    /// Raw mode swallows SIGINT, so keys are the only way out. A first Ctrl-C
+    /// cancels; a second must leave, or an agent that ignores the kill traps the
+    /// user in the TUI for good.
+    #[test]
+    fn second_cancel_key_quits_even_while_an_agent_runs() {
+        for code in [KeyCode::Esc, KeyCode::Char('c')] {
+            let mods = if code == KeyCode::Esc {
+                KeyModifiers::NONE
+            } else {
+                KeyModifiers::CONTROL
+            };
+            let mut app = test_app();
+            app.job = Some(dummy_job(0, false));
+
+            app.handle_key(code, mods);
+            assert!(app.job.as_ref().is_some_and(|j| j.cancelling), "{code:?} did not cancel");
+            assert!(!app.quit, "{code:?} quit on the first press");
+
+            app.handle_key(code, mods);
+            assert!(app.quit, "{code:?} did not quit on the second press");
+        }
+    }
+
+    /// A worker's result can already be in the channel when the user hits Esc.
+    /// Reporting "cancelled" there invites re-running an operation that in fact
+    /// completed — for `request`, that duplicates every task it created.
+    #[test]
+    fn a_result_that_beat_the_cancel_is_not_reported_as_cancelled() {
+        let mut app = test_app();
+        let (tx, rx) = mpsc::channel();
+        app.job = Some(Job {
+            label: "scrum master is planning…".into(),
+            rx,
+            frame: 0,
+            cancelling: false,
+        });
+        tx.send(Ok("created 3 tasks".into())).unwrap();
+
+        app.cancel_job();
+        app.poll_job();
+
+        assert_eq!(app.message, "created 3 tasks");
+    }
+
+    /// A genuinely cancelled worker still reads as cancelled, not as an error.
+    #[test]
+    fn a_cancelled_worker_is_reported_as_cancelled() {
+        let mut app = test_app();
+        let (tx, rx) = mpsc::channel();
+        app.job = Some(Job {
+            label: "developer working on task #1…".into(),
+            rx,
+            frame: 0,
+            cancelling: false,
+        });
+        tx.send(Err(anyhow::anyhow!(agents::CANCEL_MSG).context("spawning opencode")))
+            .unwrap();
+
+        app.cancel_job();
+        app.poll_job();
+
+        assert_eq!(app.message, "cancelled");
     }
 }
 
