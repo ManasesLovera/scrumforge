@@ -54,6 +54,8 @@ struct Job {
     rx: mpsc::Receiver<Result<String>>,
     frame: usize,
     cancelling: bool,
+    /// The user asked to leave without waiting for the worker to unwind.
+    forced: bool,
 }
 
 struct App {
@@ -95,7 +97,7 @@ fn install_signal_handlers() -> Result<Arc<AtomicBool>> {
 
 pub fn run(board: Board) -> Result<()> {
     let shutdown = install_signal_handlers()?;
-    let abandoned = {
+    let (loop_res, abandoned) = {
         let mut terminal = ratatui::init();
         let _guard = TerminalGuard;
         let mut app = App {
@@ -108,25 +110,31 @@ pub fn run(board: Board) -> Result<()> {
             quit: false,
         };
         app.fix_selection();
-        event_loop(&mut terminal, &mut app, &shutdown)?
+        let loop_res = event_loop(&mut terminal, &mut app, &shutdown);
+        // Teardown runs whatever went wrong — a write to a tty that disappeared
+        // mid-agent must not leave the agent's process tree behind us.
+        app.cancel_job();
+        (loop_res, app.await_cancelled_job())
     };
     // Printed after the guard has restored the terminal, so it lands in the
-    // user's shell rather than on the alternate screen we are tearing down.
+    // user's shell rather than on the alternate screen we are tearing down —
+    // and before the loop's error, which would otherwise hide it.
     if abandoned {
         eprintln!(
             "warning: an agent did not stop in time and was left running; \
              check for stray `opencode`, `git` or `gh` processes"
         );
     }
-    Ok(())
+    loop_res
 }
 
-/// Runs until the user quits. Returns true if an agent outlived the loop.
+/// Draw and handle input until the user quits. Cancelling and awaiting the
+/// running job is the caller's job, so it happens on the error path too.
 fn event_loop(
     terminal: &mut ratatui::DefaultTerminal,
     app: &mut App,
     shutdown: &Arc<AtomicBool>,
-) -> Result<bool> {
+) -> Result<()> {
     while !app.quit {
         terminal.draw(|f| draw(f, app))?;
         if shutdown.load(Ordering::Relaxed) {
@@ -141,9 +149,7 @@ fn event_loop(
         }
         app.poll_job();
     }
-    // Never leave an agent — or the tools it spawned — running after we exit.
-    app.cancel_job();
-    Ok(app.await_cancelled_job())
+    Ok(())
 }
 
 impl App {
@@ -230,6 +236,7 @@ impl App {
             rx,
             frame: 0,
             cancelling: false,
+            forced: false,
         });
     }
 
@@ -267,8 +274,19 @@ impl App {
         }
     }
 
+    /// Ask to leave immediately: cancel, and skip the grace period a normal
+    /// quit would spend waiting for the worker.
+    fn force_quit(&mut self) {
+        self.cancel_job();
+        if let Some(job) = self.job.as_mut() {
+            job.forced = true;
+        }
+        self.quit = true;
+    }
+
     /// Give a cancelled worker a moment to unwind so its board write is not cut
-    /// off mid-flight. Bounded, so a stuck agent cannot hold the exit hostage.
+    /// off mid-flight. Bounded, so a stuck agent cannot hold the exit hostage,
+    /// and skipped entirely once the user has said to go now.
     ///
     /// Returns true if it did not report back in time — we are about to exit out
     /// from under it, and anything it spawned that survived the kill outlives us.
@@ -276,6 +294,13 @@ impl App {
         let Some(job) = self.job.as_ref() else {
             return false;
         };
+        if job.forced {
+            // It may still finish unwinding after we are gone; say so rather
+            // than claiming a clean stop.
+            let unfinished = matches!(job.rx.try_recv(), Err(mpsc::TryRecvError::Empty));
+            self.job = None;
+            return unfinished;
+        }
         // A disconnect means the worker thread is gone, which is an orderly
         // enough exit; only a timeout means it is still in there somewhere.
         let abandoned = matches!(
@@ -314,16 +339,16 @@ impl App {
     fn handle_key(&mut self, code: KeyCode, mods: KeyModifiers) {
         let ctrl_c = code == KeyCode::Char('c') && mods.contains(KeyModifiers::CONTROL);
         // While an agent runs, the only meaningful keys are the ones that stop
-        // it. Pressing them a second time leaves anyway: raw mode swallows
-        // SIGINT, so this is the user's only way out of an agent that ignores
-        // the kill, and without it the TUI cannot be quit from the keyboard.
+        // it. A second Ctrl-C leaves without waiting: raw mode swallows SIGINT,
+        // so this is the user's only way out of an agent that ignores the kill,
+        // and without it the TUI cannot be quit from the keyboard at all.
+        // Deliberately not Esc — a double-tap or key repeat would abandon the
+        // worker mid-unwind, which is where the board write happens.
         if let Some(job) = self.job.as_ref() {
-            if ctrl_c || code == KeyCode::Esc {
-                if job.cancelling {
-                    self.quit = true;
-                } else {
-                    self.cancel_job();
-                }
+            if ctrl_c && job.cancelling {
+                self.force_quit();
+            } else if ctrl_c || code == KeyCode::Esc {
+                self.cancel_job();
             }
             return;
         }
@@ -617,7 +642,7 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
             Span::raw(" or "),
             Span::styled("Ctrl-C", Style::default().fg(Color::Red).bold()),
             Span::raw(if job.cancelling {
-                "  │ stopping… press again to quit anyway"
+                "  │ stopping… Ctrl-C again to quit now"
             } else {
                 "  │ cancel the running agent"
             }),
@@ -665,8 +690,10 @@ const SPINNER: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '�
 
 fn draw_busy(f: &mut Frame, job: &Job) {
     let frame_char = SPINNER[job.frame % SPINNER.len()];
+    // Kept short enough to survive a 60-column terminal: the sizing below
+    // clamps the box to the screen, so a longer line loses its tail.
     let hint = if job.cancelling {
-        "stopping the agent and its subprocesses… press again to quit anyway"
+        "stopping the agent… Ctrl-C again to quit now"
     } else {
         "agents can take minutes · Esc or Ctrl-C to cancel"
     };
@@ -863,13 +890,22 @@ mod tests {
         }
     }
 
-    /// Nothing may be truncated at the smallest terminal we expect to run in.
+    /// Nothing may be truncated at the smallest terminal we expect to run in —
+    /// including the trailing notes and footer, which are what a new line added
+    /// to `help::KEYS` silently pushes off the bottom.
     #[test]
     fn help_overlay_fits_an_80x24_terminal() {
         let rendered = render_help(80, 24);
         for (_, desc) in help::KEYS {
             assert!(rendered.contains(desc), "truncated at 80x24:\n{rendered}");
         }
+        for note in help::TUI_NOTES {
+            assert!(rendered.contains(note), "note dropped at 80x24:\n{rendered}");
+        }
+        assert!(
+            rendered.contains("press any key to close"),
+            "footer dropped at 80x24:\n{rendered}"
+        );
     }
 
     fn render_busy(job: &Job, width: u16, height: u16) -> String {
@@ -894,15 +930,21 @@ mod tests {
             rx,
             frame,
             cancelling,
+            forced: false,
         }
     }
+
+    /// The smallest terminals we claim to support. Every overlay assertion runs
+    /// over all of them — a hint that only fits at 80 columns is a hint the user
+    /// loses exactly when they need it.
+    const SIZES: [(u16, u16); 3] = [(120, 30), (80, 24), (60, 12)];
 
     /// The cancel hint used to live in a `"\n(…)"` span, which ratatui renders as
     /// one unbroken run — the sentence ran off the box and was clipped mid-word.
     /// It must appear whole, on its own line, at the sizes we support.
     #[test]
     fn busy_overlay_shows_the_whole_cancel_hint() {
-        for (w, h) in [(120, 30), (80, 24), (60, 12)] {
+        for (w, h) in SIZES {
             let rendered = render_busy(&dummy_job(0, false), w, h);
             assert!(
                 rendered.contains("Esc or Ctrl-C to cancel"),
@@ -931,18 +973,22 @@ mod tests {
         assert_eq!(seen.len(), SPINNER.len(), "spinner does not animate");
     }
 
-    /// Cancelling swaps the hint, so the user knows the keypress registered.
+    /// Cancelling swaps the hint, so the user knows the keypress registered —
+    /// and the escape hatch must survive the narrowest terminal, since a wedged
+    /// agent is the one situation where it is the only way out.
     #[test]
     fn busy_overlay_reports_cancellation() {
-        let rendered = render_busy(&dummy_job(0, true), 80, 24);
-        assert!(
-            rendered.contains("stopping the agent"),
-            "no cancellation feedback:\n{rendered}"
-        );
-        assert!(
-            rendered.contains("press again to quit"),
-            "no escape hatch offered:\n{rendered}"
-        );
+        for (w, h) in SIZES {
+            let rendered = render_busy(&dummy_job(0, true), w, h);
+            assert!(
+                rendered.contains("stopping the agent"),
+                "no cancellation feedback at {w}x{h}:\n{rendered}"
+            );
+            assert!(
+                rendered.contains("Ctrl-C again to quit now"),
+                "escape hatch clipped at {w}x{h}:\n{rendered}"
+            );
+        }
     }
 
     fn test_app() -> App {
@@ -962,23 +1008,68 @@ mod tests {
     /// cancels; a second must leave, or an agent that ignores the kill traps the
     /// user in the TUI for good.
     #[test]
-    fn second_cancel_key_quits_even_while_an_agent_runs() {
-        for code in [KeyCode::Esc, KeyCode::Char('c')] {
-            let mods = if code == KeyCode::Esc {
-                KeyModifiers::NONE
-            } else {
-                KeyModifiers::CONTROL
-            };
-            let mut app = test_app();
-            app.job = Some(dummy_job(0, false));
+    fn second_ctrl_c_quits_even_while_an_agent_runs() {
+        // Cancelling reaches process-wide state shared with the agents tests.
+        let _serial = agents::test_guard();
+        let mut app = test_app();
+        app.job = Some(dummy_job(0, false));
 
-            app.handle_key(code, mods);
-            assert!(app.job.as_ref().is_some_and(|j| j.cancelling), "{code:?} did not cancel");
-            assert!(!app.quit, "{code:?} quit on the first press");
+        app.handle_key(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        assert!(app.job.as_ref().is_some_and(|j| j.cancelling), "did not cancel");
+        assert!(!app.quit, "quit on the first press");
 
-            app.handle_key(code, mods);
-            assert!(app.quit, "{code:?} did not quit on the second press");
+        app.handle_key(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        assert!(app.quit, "did not quit on the second press");
+        assert!(
+            app.job.as_ref().is_some_and(|j| j.forced),
+            "quit without marking the job forced, so exit still waits out the grace period"
+        );
+    }
+
+    /// Esc cancels but must never force the exit: it is one key, so a repeat or
+    /// a double-tap would abandon the worker mid-unwind — and the unwind is
+    /// where the board write happens.
+    #[test]
+    fn repeated_esc_cancels_but_does_not_quit() {
+        // Cancelling reaches process-wide state shared with the agents tests.
+        let _serial = agents::test_guard();
+        let mut app = test_app();
+        app.job = Some(dummy_job(0, false));
+
+        for _ in 0..3 {
+            app.handle_key(KeyCode::Esc, KeyModifiers::NONE);
         }
+        assert!(app.job.as_ref().is_some_and(|j| j.cancelling), "did not cancel");
+        assert!(!app.quit, "Esc forced a quit");
+    }
+
+    /// A forced quit must not then sit in the grace period it was meant to skip.
+    #[test]
+    fn forced_quit_does_not_wait_for_the_worker() {
+        // Cancelling reaches process-wide state shared with the agents tests.
+        let _serial = agents::test_guard();
+        let mut app = test_app();
+        // Sender held for the whole test: a worker that is still running, which
+        // is the only case where the wait would have cost anything.
+        let (_tx, rx) = mpsc::channel();
+        app.job = Some(Job {
+            label: "developer working on task #1…".into(),
+            rx,
+            frame: 0,
+            cancelling: false,
+            forced: false,
+        });
+        app.force_quit();
+
+        let start = std::time::Instant::now();
+        let abandoned = app.await_cancelled_job();
+
+        assert!(
+            start.elapsed() < SHUTDOWN_GRACE,
+            "forced exit still waited {:?}",
+            start.elapsed()
+        );
+        assert!(abandoned, "a worker left running should be reported");
     }
 
     /// A worker's result can already be in the channel when the user hits Esc.
@@ -986,6 +1077,8 @@ mod tests {
     /// completed — for `request`, that duplicates every task it created.
     #[test]
     fn a_result_that_beat_the_cancel_is_not_reported_as_cancelled() {
+        // Cancelling reaches process-wide state shared with the agents tests.
+        let _serial = agents::test_guard();
         let mut app = test_app();
         let (tx, rx) = mpsc::channel();
         app.job = Some(Job {
@@ -993,6 +1086,7 @@ mod tests {
             rx,
             frame: 0,
             cancelling: false,
+            forced: false,
         });
         tx.send(Ok("created 3 tasks".into())).unwrap();
 
@@ -1005,6 +1099,8 @@ mod tests {
     /// A genuinely cancelled worker still reads as cancelled, not as an error.
     #[test]
     fn a_cancelled_worker_is_reported_as_cancelled() {
+        // Cancelling reaches process-wide state shared with the agents tests.
+        let _serial = agents::test_guard();
         let mut app = test_app();
         let (tx, rx) = mpsc::channel();
         app.job = Some(Job {
@@ -1012,8 +1108,9 @@ mod tests {
             rx,
             frame: 0,
             cancelling: false,
+            forced: false,
         });
-        tx.send(Err(anyhow::anyhow!(agents::CANCEL_MSG).context("spawning opencode")))
+        tx.send(Err(anyhow::Error::new(agents::Cancelled).context("spawning opencode")))
             .unwrap();
 
         app.cancel_job();

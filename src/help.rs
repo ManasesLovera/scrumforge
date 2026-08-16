@@ -119,8 +119,9 @@ pub const FLOW: &[&str] = &[
 
 /// Caveats worth repeating wherever the keys are shown.
 pub const TUI_NOTES: &[&str] = &[
-    "agent turns take minutes; Ctrl-C aborts a running one",
-    "press Ctrl-C again while it stops to quit without waiting",
+    // One line, not two: the overlay is sized to its content and 24-row
+    // terminals have no headroom left.
+    "agent turns take minutes; Ctrl-C aborts one, again to quit",
     "board state is saved after each step",
 ];
 
