@@ -59,6 +59,9 @@ pub struct Task {
 #[derive(Debug)]
 pub struct Board {
     pub repo_path: PathBuf,
+    /// Kept so a background worker can open its own connection to the same
+    /// board — `Connection` is not shareable across threads.
+    pub db_path: PathBuf,
     conn: Connection,
 }
 
@@ -81,7 +84,11 @@ impl Board {
             .with_context(|| format!("opening sqlite db {}", db_file.display()))?;
         conn.execute_batch(SCHEMA)
             .with_context(|| format!("initializing schema in {}", db_file.display()))?;
-        Ok(Board { repo_path, conn })
+        Ok(Board {
+            repo_path,
+            db_path: db_file.to_path_buf(),
+            conn,
+        })
     }
 
     pub fn add_task(&mut self, title: &str, description: &str) -> Result<Task> {
