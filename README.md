@@ -75,6 +75,7 @@ The web UI opens on a global project dashboard. Project views live under
 
 ```text
 /                              global project dashboard
+/users                         user and project-scope management
 /p/<route>                     project overview
 /p/<route>/backlog             product backlog
 /p/<route>/sprints             sprint list
@@ -92,6 +93,7 @@ project containing the current directory.
 
 ```bash
 scrumforge project add|list|show|set|archive|rm|rename-route|migrate
+scrumforge user add|list|show|set|scope|unscope|rm
 scrumforge sprint add|list|show|activate|close|board
 scrumforge backlog add|list
 scrumforge tasks [--sprint current|backlog|all|<number>]
@@ -109,6 +111,16 @@ scrumforge activity [--limit N]
 scrumforge worktree list|prune
 scrumforge db backup|check
 scrumforge help [topic]
+```
+
+User profiles are local-only (no authentication). A user with one or more
+project scopes can only be assigned tasks in those projects; a user with no
+scopes can be assigned anywhere.
+
+```bash
+scrumforge user add dev-1 --name "Dev One" --kind agent --scope acme
+scrumforge user scope dev-1 docs
+scrumforge user list
 ```
 
 `request` asks the scrum master (Scrum) or spec planner (SDD) to split your text

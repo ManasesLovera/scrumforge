@@ -9,9 +9,9 @@ use serde_json::{Value, json};
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use crate::board::{Project, Status, Store};
+use crate::board::{Project, Status, Store, User};
 use crate::ops;
-use crate::resolve::{self, validate_route};
+use crate::resolve::{self, validate_handle, validate_route};
 
 const INDEX_HTML: &str = include_str!("web/index.html");
 
@@ -65,6 +65,31 @@ struct NewProject {
     worktree_root: Option<String>,
     #[serde(default)]
     max_parallel_runs: Option<u32>,
+}
+
+#[derive(Deserialize)]
+struct NewUser {
+    handle: String,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    kind: Option<String>,
+    #[serde(default)]
+    notes: Option<String>,
+    #[serde(default)]
+    projects: Option<Vec<String>>,
+}
+
+#[derive(Deserialize)]
+struct UpdateUser {
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    kind: Option<String>,
+    #[serde(default)]
+    notes: Option<String>,
+    #[serde(default)]
+    projects: Option<Vec<String>>,
 }
 
 #[derive(Deserialize)]
@@ -137,8 +162,14 @@ async fn serve(store: Store, port: u16) -> Result<()> {
 
     let router = Router::new()
         .route("/", get(index))
+        .route("/users", get(index))
         .route("/p/{route}", get(index))
         .route("/p/{route}/{*rest}", get(index))
+        .route("/api/users", get(list_users).post(create_user))
+        .route(
+            "/api/users/{handle}",
+            get(get_user).patch(update_user).delete(delete_user),
+        )
         .route("/api/projects", get(list_projects).post(create_project))
         .route("/api/projects/{route}", get(get_project))
         .route(
@@ -229,6 +260,137 @@ fn project_json(store: &Store, project: &Project) -> Result<Value> {
             "sprints": sprints,
         },
     }))
+}
+
+fn user_json(store: &Store, user: &User) -> Result<Value> {
+    let projects = store
+        .user_projects(user.id)?
+        .into_iter()
+        .map(|p| p.route)
+        .collect::<Vec<_>>();
+    Ok(json!({
+        "id": user.id,
+        "handle": user.handle,
+        "name": user.name,
+        "kind": user.kind,
+        "notes": user.notes,
+        "projects": projects,
+        "created_at": user.created_at,
+        "updated_at": user.updated_at,
+    }))
+}
+
+fn project_ids_for_routes(store: &Store, routes: &[String]) -> Result<Vec<i64>, ApiError> {
+    let mut ids = Vec::new();
+    for route in routes {
+        let project = store
+            .project_by_route(route)
+            .map_err(internal)?
+            .ok_or_else(|| bad(format!("unknown project route '{route}'")))?;
+        ids.push(project.id);
+    }
+    Ok(ids)
+}
+
+async fn list_users(State(app): State<App>) -> Result<Json<Value>, ApiError> {
+    let store = lock(&app.store);
+    let users = store.users().map_err(internal)?;
+    let values = users
+        .iter()
+        .map(|u| user_json(&store, u))
+        .collect::<Result<Vec<_>>>()
+        .map_err(internal)?;
+    Ok(Json(json!({ "users": values })))
+}
+
+async fn create_user(
+    State(app): State<App>,
+    Json(req): Json<NewUser>,
+) -> Result<Json<Value>, ApiError> {
+    validate_handle(&req.handle).map_err(|e| bad(e.to_string()))?;
+    let kind = resolve::parse_user_kind(req.kind.as_deref().unwrap_or("human"))
+        .map_err(|e| bad(e.to_string()))?;
+    let store = lock(&app.store);
+    if store
+        .user_by_handle(&req.handle)
+        .map_err(internal)?
+        .is_some()
+    {
+        return Err(ApiError(
+            StatusCode::CONFLICT,
+            format!("user '{}' already exists", req.handle),
+        ));
+    }
+    let project_ids = match req.projects.as_deref() {
+        Some(routes) => project_ids_for_routes(&store, routes)?,
+        None => Vec::new(),
+    };
+    let user = store
+        .add_user(
+            &req.handle,
+            req.name.as_deref().unwrap_or(&req.handle),
+            &kind,
+            req.notes.as_deref().unwrap_or(""),
+        )
+        .map_err(internal)?;
+    store
+        .set_user_projects(user.id, &project_ids)
+        .map_err(internal)?;
+    Ok(Json(user_json(&store, &user).map_err(internal)?))
+}
+
+async fn get_user(
+    State(app): State<App>,
+    Path(handle): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    let store = lock(&app.store);
+    let user = store
+        .user_by_handle(&handle)
+        .map_err(internal)?
+        .ok_or_else(|| not_found(format!("user '{handle}' not found")))?;
+    Ok(Json(user_json(&store, &user).map_err(internal)?))
+}
+
+async fn update_user(
+    State(app): State<App>,
+    Path(handle): Path<String>,
+    Json(req): Json<UpdateUser>,
+) -> Result<Json<Value>, ApiError> {
+    let store = lock(&app.store);
+    let mut user = store
+        .user_by_handle(&handle)
+        .map_err(internal)?
+        .ok_or_else(|| not_found(format!("user '{handle}' not found")))?;
+    if let Some(name) = req.name {
+        user.name = name;
+    }
+    if let Some(kind) = req.kind {
+        user.kind = resolve::parse_user_kind(&kind).map_err(|e| bad(e.to_string()))?;
+    }
+    if let Some(notes) = req.notes {
+        user.notes = notes;
+    }
+    store.save_user(&user).map_err(internal)?;
+    if let Some(routes) = req.projects {
+        let project_ids = project_ids_for_routes(&store, &routes)?;
+        store
+            .set_user_projects(user.id, &project_ids)
+            .map_err(internal)?;
+    }
+    Ok(Json(user_json(&store, &user).map_err(internal)?))
+}
+
+async fn delete_user(
+    State(app): State<App>,
+    Path(handle): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    let store = lock(&app.store);
+    let user = store
+        .user_by_handle(&handle)
+        .map_err(internal)?
+        .ok_or_else(|| not_found(format!("user '{handle}' not found")))?;
+    store.remove_user(user.id).map_err(internal)?;
+    Ok(Json(json!({ "deleted": user.handle })))
 }
 
 async fn list_projects(State(app): State<App>) -> Result<Json<Value>, ApiError> {

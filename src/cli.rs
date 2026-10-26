@@ -3,7 +3,7 @@ use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 
 use crate::agents;
-use crate::board::{Methodology, Project, Spec, SprintStatus, Status, Store};
+use crate::board::{Methodology, Project, Spec, SprintStatus, Status, Store, User};
 use crate::ops;
 use crate::resolve::{self, validate_route};
 
@@ -35,6 +35,15 @@ PROJECTS:
     project archive <route> | rm <route> --yes
     project rename-route <old> <new>
     project migrate <path> --route <route>
+
+USERS:
+    user add <handle> [--name N] [--kind human|agent] [--scope route]...
+    user list [--scope route]
+    user show <handle>
+    user set <handle> [--name N] [--kind human|agent] [--notes TEXT]
+    user scope <handle> <route>... | --clear
+    user unscope <handle> <route>...
+    user rm <handle> --yes
 
 SPRINTS:
     sprint add --name N [--goal G] [--start DATE] [--end DATE] [--capacity N]
@@ -155,6 +164,7 @@ pub fn run(store: &Store, globals: &Globals, args: &[String]) -> Result<()> {
     let rest = &args[1..];
     match cmd {
         "project" => project_cmd(store, globals, rest),
+        "user" => user_cmd(store, globals, rest),
         "sprint" => sprint_cmd(store, globals, rest),
         "backlog" => backlog_cmd(store, globals, rest),
         "tasks" => tasks_cmd(store, globals, rest),
@@ -486,6 +496,280 @@ fn ensure_route_free(store: &Store, route: &str) -> Result<()> {
     if store.project_by_route(route)?.is_some() {
         bail!("project route '{route}' already exists");
     }
+    Ok(())
+}
+
+fn user_cmd(store: &Store, globals: &Globals, args: &[String]) -> Result<()> {
+    let Some(sub) = args.first().map(String::as_str) else {
+        bail!("usage: scrumforge user <add|list|show|set|scope|unscope|rm>");
+    };
+    let rest = &args[1..];
+    match sub {
+        "add" => user_add(store, globals, rest),
+        "list" => user_list(store, globals, rest),
+        "show" => user_show(store, globals, rest),
+        "set" => user_set(store, globals, rest),
+        "scope" => user_scope(store, globals, rest, true),
+        "unscope" => user_scope(store, globals, rest, false),
+        "rm" => user_rm(store, globals, rest),
+        other => bail!("unknown user command: {other}"),
+    }
+}
+
+fn require_user(store: &Store, handle: &str) -> Result<User> {
+    store
+        .user_by_handle(handle)?
+        .with_context(|| format!("unknown user '{handle}'"))
+}
+
+fn project_ids_for(store: &Store, routes: &[String]) -> Result<Vec<i64>> {
+    let mut ids = Vec::new();
+    for route in routes {
+        let project = store
+            .project_by_route(route)?
+            .with_context(|| format!("unknown project route '{route}'"))?;
+        ids.push(project.id);
+    }
+    Ok(ids)
+}
+
+fn user_json(store: &Store, user: &User) -> Result<Value> {
+    let projects = store
+        .user_projects(user.id)?
+        .into_iter()
+        .map(|p| p.route)
+        .collect::<Vec<_>>();
+    Ok(json!({
+        "id": user.id,
+        "handle": user.handle,
+        "name": user.name,
+        "kind": user.kind,
+        "notes": user.notes,
+        "projects": projects,
+        "created_at": user.created_at,
+        "updated_at": user.updated_at,
+    }))
+}
+
+fn print_user(store: &Store, user: &User) {
+    let scopes = store
+        .user_projects(user.id)
+        .map(|projects| {
+            if projects.is_empty() {
+                "(all projects)".to_string()
+            } else {
+                projects
+                    .into_iter()
+                    .map(|p| p.route)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            }
+        })
+        .unwrap_or_else(|_| "(unknown)".into());
+    println!(
+        "{:<20} {:<8} {:<24} {}",
+        user.handle, user.kind, user.name, scopes
+    );
+    if !user.notes.is_empty() {
+        println!("  notes: {}", user.notes);
+    }
+}
+
+fn user_add(store: &Store, globals: &Globals, args: &[String]) -> Result<()> {
+    let handle = args
+        .first()
+        .context("usage: user add <handle> [--name N] [--kind human|agent] [--scope route]...")?;
+    resolve::validate_handle(handle)?;
+    if store.user_by_handle(handle)?.is_some() {
+        bail!("user '{handle}' already exists");
+    }
+    let mut name = handle.clone();
+    let mut kind = "human".to_string();
+    let mut notes = String::new();
+    let mut routes: Vec<String> = Vec::new();
+    let mut i = 1;
+    while i < args.len() {
+        if let Some(value) = value_flag(args, &mut i, "--name")? {
+            name = value;
+        } else if let Some(value) = value_flag(args, &mut i, "--kind")? {
+            kind = resolve::parse_user_kind(&value)?;
+        } else if let Some(value) = value_flag(args, &mut i, "--notes")? {
+            notes = value;
+        } else if let Some(value) = value_flag(args, &mut i, "--scope")? {
+            routes.push(value);
+        } else {
+            bail!("unknown user add option: {}", args[i]);
+        }
+    }
+    let project_ids = project_ids_for(store, &routes)?;
+    let user = store.add_user(handle, &name, &kind, &notes)?;
+    if !project_ids.is_empty() {
+        store.set_user_projects(user.id, &project_ids)?;
+    }
+    if globals.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&user_json(store, &user)?)?
+        );
+    } else {
+        println!("added user {} ({})", user.handle, user.kind);
+        print_user(store, &user);
+    }
+    Ok(())
+}
+
+fn user_list(store: &Store, globals: &Globals, args: &[String]) -> Result<()> {
+    let mut project = None;
+    let mut i = 0;
+    while i < args.len() {
+        if let Some(value) = value_flag(args, &mut i, "--scope")? {
+            project = Some(value);
+        } else {
+            bail!("unknown user list option: {}", args[i]);
+        }
+    }
+    let project_id = match project {
+        Some(route) => Some(
+            store
+                .project_by_route(&route)?
+                .with_context(|| format!("unknown project route '{route}'"))?
+                .id,
+        ),
+        None => None,
+    };
+    let mut users = Vec::new();
+    for user in store.users()? {
+        if let Some(project_id) = project_id
+            && !store.user_can_access_project(user.id, project_id)?
+        {
+            continue;
+        }
+        users.push(user);
+    }
+    if globals.json {
+        let values = users
+            .iter()
+            .map(|u| user_json(store, u))
+            .collect::<Result<Vec<_>>>()?;
+        println!("{}", serde_json::to_string_pretty(&values)?);
+        return Ok(());
+    }
+    if users.is_empty() {
+        println!("(no users)");
+        return Ok(());
+    }
+    println!("{:<20} {:<8} {:<24} PROJECTS", "HANDLE", "KIND", "NAME");
+    for user in &users {
+        print_user(store, user);
+    }
+    Ok(())
+}
+
+fn user_show(store: &Store, globals: &Globals, args: &[String]) -> Result<()> {
+    let handle = args.first().context("usage: user show <handle>")?;
+    let user = require_user(store, handle)?;
+    if globals.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&user_json(store, &user)?)?
+        );
+        return Ok(());
+    }
+    println!("handle: {}", user.handle);
+    println!("name:   {}", user.name);
+    println!("kind:   {}", user.kind);
+    if !user.notes.is_empty() {
+        println!("notes:  {}", user.notes);
+    }
+    let projects = store.user_projects(user.id)?;
+    if projects.is_empty() {
+        println!("scope:  all projects (unrestricted)");
+    } else {
+        println!(
+            "scope:  {}",
+            projects
+                .into_iter()
+                .map(|p| p.route)
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+    Ok(())
+}
+
+fn user_set(store: &Store, _globals: &Globals, args: &[String]) -> Result<()> {
+    let handle = args
+        .first()
+        .context("usage: user set <handle> [--name N] [--kind human|agent] [--notes TEXT]")?;
+    let mut user = require_user(store, handle)?;
+    let mut i = 1;
+    while i < args.len() {
+        if let Some(value) = value_flag(args, &mut i, "--name")? {
+            user.name = value;
+        } else if let Some(value) = value_flag(args, &mut i, "--kind")? {
+            user.kind = resolve::parse_user_kind(&value)?;
+        } else if let Some(value) = value_flag(args, &mut i, "--notes")? {
+            user.notes = value;
+        } else {
+            bail!("unknown user set option: {}", args[i]);
+        }
+    }
+    store.save_user(&user)?;
+    println!("updated user {}", user.handle);
+    Ok(())
+}
+
+fn user_scope(store: &Store, _globals: &Globals, args: &[String], add: bool) -> Result<()> {
+    let verb = if add { "scope" } else { "unscope" };
+    let handle = args
+        .first()
+        .with_context(|| format!("usage: user {verb} <handle> <route>..."))?;
+    let user = require_user(store, handle)?;
+    let rest = &args[1..];
+    if add && rest.iter().any(|a| a == "--clear") {
+        store.set_user_projects(user.id, &[])?;
+        println!(
+            "user {} is now unscoped (assignable to all projects)",
+            user.handle
+        );
+        return Ok(());
+    }
+    let mut routes = Vec::new();
+    let mut i = 0;
+    while i < rest.len() {
+        if let Some(value) = value_flag(rest, &mut i, "--scope")? {
+            routes.push(value);
+        } else {
+            routes.push(rest[i].clone());
+            i += 1;
+        }
+    }
+    if routes.is_empty() {
+        bail!("usage: user {verb} <handle> <route>...");
+    }
+    for route in &routes {
+        let project = store
+            .project_by_route(route)?
+            .with_context(|| format!("unknown project route '{route}'"))?;
+        if add {
+            store.add_user_project(user.id, project.id)?;
+        } else {
+            store.remove_user_project(user.id, project.id)?;
+        }
+    }
+    println!("user {} scopes updated:", user.handle);
+    print_user(store, &user);
+    Ok(())
+}
+
+fn user_rm(store: &Store, _globals: &Globals, args: &[String]) -> Result<()> {
+    let handle = args.first().context("usage: user rm <handle> --yes")?;
+    if !args.iter().any(|a| a == "--yes") {
+        bail!("refusing to delete user without --yes");
+    }
+    let user = require_user(store, handle)?;
+    store.remove_user(user.id)?;
+    println!("deleted user {}", user.handle);
     Ok(())
 }
 

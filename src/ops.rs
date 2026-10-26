@@ -156,6 +156,9 @@ pub fn run_task(store: &Store, project: &Project, id: u32, actor: &str) -> Resul
     let task = store
         .task(project.id, id)?
         .with_context(|| format!("task #{id} not found"))?;
+    if let Some(assignee) = task.assignee.as_deref() {
+        ensure_assignable(store, project, assignee)?;
+    }
     if task.status == Status::Backlog {
         bail!("task #{id} is in the backlog; move it into a sprint before running it");
     }
@@ -236,11 +239,27 @@ pub fn run_task(store: &Store, project: &Project, id: u32, actor: &str) -> Resul
     }
 }
 
+fn ensure_assignable(store: &Store, project: &Project, who: &str) -> Result<()> {
+    if let Some(user) = store.user_by_handle(who)?
+        && !store.user_can_access_project(user.id, project.id)?
+    {
+        bail!(
+            "user '{}' is not scoped to project '{}'; add it with: scrumforge user scope {} {}",
+            user.handle,
+            project.route,
+            user.handle,
+            project.route
+        );
+    }
+    Ok(())
+}
+
 pub fn assign(store: &Store, project: &Project, id: u32, who: &str, actor: &str) -> Result<String> {
     let who = who.trim();
     if who.is_empty() {
         bail!("usage: assign <id> <developer|reviewer|name>");
     }
+    ensure_assignable(store, project, who)?;
     let task = store.update_task(project.id, id, |task| {
         task.assignee = Some(who.to_string());
     })?;

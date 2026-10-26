@@ -124,6 +124,17 @@ impl fmt::Display for SprintStatus {
 }
 
 #[derive(Debug, Clone)]
+pub struct User {
+    pub id: i64,
+    pub handle: String,
+    pub name: String,
+    pub kind: String,
+    pub notes: String,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone)]
 pub struct Project {
     pub id: i64,
     pub route: String,
@@ -242,6 +253,15 @@ pub struct Store {
 
 const SCHEMA: &str = r#"
 PRAGMA foreign_keys = ON;
+CREATE TABLE IF NOT EXISTS users (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    handle     TEXT NOT NULL UNIQUE COLLATE NOCASE,
+    name       TEXT NOT NULL,
+    kind       TEXT NOT NULL DEFAULT 'human' CHECK (kind IN ('human', 'agent')),
+    notes      TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
 CREATE TABLE IF NOT EXISTS projects (
     id               INTEGER PRIMARY KEY AUTOINCREMENT,
     route            TEXT NOT NULL UNIQUE COLLATE NOCASE,
@@ -254,6 +274,11 @@ CREATE TABLE IF NOT EXISTS projects (
     archived_at      TEXT,
     created_at       TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at       TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE TABLE IF NOT EXISTS user_projects (
+    user_id    INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    PRIMARY KEY (user_id, project_id)
 );
 CREATE TABLE IF NOT EXISTS sprints (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -336,6 +361,7 @@ CREATE INDEX IF NOT EXISTS idx_sprints_project ON sprints(project_id, number);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_one_active_sprint
     ON sprints(project_id) WHERE status = 'active';
 CREATE INDEX IF NOT EXISTS idx_events_project ON events(project_id, id DESC);
+CREATE INDEX IF NOT EXISTS idx_user_projects_project ON user_projects(project_id);
 "#;
 
 impl Store {
@@ -876,6 +902,121 @@ impl Store {
             .context("listing events")
     }
 
+    pub fn users(&self) -> Result<Vec<User>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, handle, name, kind, notes, created_at, updated_at
+             FROM users ORDER BY handle COLLATE NOCASE",
+        )?;
+        let rows = stmt.query_map([], user_from_row)?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .context("listing users")
+    }
+
+    pub fn user_by_handle(&self, handle: &str) -> Result<Option<User>> {
+        self.conn
+            .query_row(
+                "SELECT id, handle, name, kind, notes, created_at, updated_at
+                 FROM users WHERE handle = ?1 COLLATE NOCASE",
+                params![handle],
+                user_from_row,
+            )
+            .optional()
+            .context("looking up user")
+    }
+
+    pub fn add_user(&self, handle: &str, name: &str, kind: &str, notes: &str) -> Result<User> {
+        self.conn.execute(
+            "INSERT INTO users (handle, name, kind, notes) VALUES (?1, ?2, ?3, ?4)",
+            params![handle, name, kind, notes],
+        )?;
+        self.user_by_handle(handle)?
+            .context("user missing after insert")
+    }
+
+    pub fn save_user(&self, u: &User) -> Result<()> {
+        self.conn.execute(
+            "UPDATE users SET handle = ?1, name = ?2, kind = ?3, notes = ?4,
+                updated_at = CURRENT_TIMESTAMP WHERE id = ?5",
+            params![u.handle, u.name, u.kind, u.notes, u.id],
+        )?;
+        Ok(())
+    }
+
+    pub fn remove_user(&self, id: i64) -> Result<()> {
+        self.conn
+            .execute("DELETE FROM users WHERE id = ?1", params![id])?;
+        Ok(())
+    }
+
+    pub fn user_projects(&self, user_id: i64) -> Result<Vec<Project>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT p.id, p.route, p.name, p.repo_path, p.default_branch, p.worktree_root,
+                    p.methodology, p.max_parallel_runs, p.archived_at, p.created_at, p.updated_at
+             FROM projects p
+             JOIN user_projects up ON up.project_id = p.id
+             WHERE up.user_id = ?1
+             ORDER BY p.route",
+        )?;
+        let rows = stmt.query_map(params![user_id], project_from_row)?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .context("listing user projects")
+    }
+
+    pub fn set_user_projects(&self, user_id: i64, project_ids: &[i64]) -> Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute(
+            "DELETE FROM user_projects WHERE user_id = ?1",
+            params![user_id],
+        )?;
+        {
+            let mut stmt = tx.prepare(
+                "INSERT OR IGNORE INTO user_projects (user_id, project_id) VALUES (?1, ?2)",
+            )?;
+            for project_id in project_ids {
+                stmt.execute(params![user_id, project_id])?;
+            }
+        }
+        tx.execute(
+            "UPDATE users SET updated_at = CURRENT_TIMESTAMP WHERE id = ?1",
+            params![user_id],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn add_user_project(&self, user_id: i64, project_id: i64) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR IGNORE INTO user_projects (user_id, project_id) VALUES (?1, ?2)",
+            params![user_id, project_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn remove_user_project(&self, user_id: i64, project_id: i64) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM user_projects WHERE user_id = ?1 AND project_id = ?2",
+            params![user_id, project_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn user_can_access_project(&self, user_id: i64, project_id: i64) -> Result<bool> {
+        let scoped: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM user_projects WHERE user_id = ?1",
+            params![user_id],
+            |row| row.get(0),
+        )?;
+        if scoped == 0 {
+            return Ok(true);
+        }
+        let allowed: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM user_projects WHERE user_id = ?1 AND project_id = ?2",
+            params![user_id, project_id],
+            |row| row.get(0),
+        )?;
+        Ok(allowed > 0)
+    }
+
     pub fn counts(&self, project_id: i64) -> Result<(i64, i64, i64, i64)> {
         let backlog: i64 = self.conn.query_row(
             "SELECT COUNT(*) FROM tasks WHERE project_id = ?1 AND sprint_id IS NULL",
@@ -905,6 +1046,18 @@ const TASK_SELECT: &str = "SELECT id, project_id, sprint_id, title, description,
     acceptance_criteria, status, assignee, branch, pr_url, review_notes,
     spec_slug, change_slug, requirement_key, estimate, created_at, updated_at
     FROM tasks";
+
+fn user_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<User> {
+    Ok(User {
+        id: row.get(0)?,
+        handle: row.get(1)?,
+        name: row.get(2)?,
+        kind: row.get(3)?,
+        notes: row.get(4)?,
+        created_at: row.get(5)?,
+        updated_at: row.get(6)?,
+    })
+}
 
 fn project_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Project> {
     let methodology: String = row.get(6)?;

@@ -44,19 +44,20 @@ in agent sessions; it needs an interactive terminal.
   (default), `repl`, `serve`/`--web`, or the CLI. `serve` does not require a
   resolved project; it opens the global dashboard.
 - `src/board.rs` — global SQLite schema, migrations, models, and `Store` methods
-  for projects, sprints, tasks, specs, changes, events, counts, and atomic task
-  claims. Status values: `backlog`, `todo`, `in-progress`, `in-review`,
-  `changes-requested`, `done`, `cancelled`.
+  for projects, users, user/project scopes, sprints, tasks, specs, changes,
+  events, counts, and atomic task claims. Status values: `backlog`, `todo`,
+  `in-progress`, `in-review`, `changes-requested`, `done`, `cancelled`.
 - `src/resolve.rs` — default DB/config paths, `.scrumforge.toml` binding, route
   validation, and project/profile resolution.
 - `src/ops.rs` — shared actions (`request`, `run_task`, `rework`,
   `add_backlog_task`, move/assign, sprints, SDD spec/change) used by all
   frontends. Returns human-readable result strings.
-- `src/cli.rs` — global flag parsing plus project, sprint, backlog, task, spec,
-  change, context, activity, worktree, and db commands.
+- `src/cli.rs` — global flag parsing plus project, user, sprint, backlog, task,
+  spec, change, context, activity, worktree, and db commands.
 - `src/repl.rs` — line-oriented REPL (rustyline) with project/sprint context.
 - `src/serve.rs` — axum HTTP frontend (`--web`/`serve`, loopback only). Serves an
-  embedded SPA and a project-scoped JSON API under `/api/projects`.
+  embedded SPA, a user API under `/api/users`, and a project-scoped JSON API
+  under `/api/projects`.
 - `src/web/index.html` — self-contained dashboard and project views: overview,
   sprint board, backlog, sprints, SDD specs, and activity.
 - `src/tui.rs` — interactive terminal UI (ratatui + crossterm): board/backlog

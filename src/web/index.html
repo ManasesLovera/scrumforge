@@ -479,6 +479,10 @@
   .badge.approved, .badge.active { color: var(--st-done); }
   .badge.implementing { color: var(--st-progress); }
   .badge.archived, .badge.completed { color: var(--ink-3); }
+  .checks { display: flex; flex-direction: column; gap: 7px; max-height: 180px; overflow-y: auto; padding: 2px; }
+  .check { display: flex; align-items: center; gap: 8px; font-size: 13px; color: var(--ink-2); }
+  .check input { width: 15px; height: 15px; accent-color: var(--ember); }
+  .scope-list { display: flex; flex-wrap: wrap; gap: 5px; }
   @media (max-width: 720px) { .nav { padding: 0 10px; } .page { padding: 16px 12px 40px; } .header-actions .btn { padding: 6px 10px; } }
 </style>
 
@@ -487,6 +491,7 @@
   <a class="brand" href="/" style="text-decoration:none;color:inherit">scrum<span>forge</span></a>
   <div class="project-switch" id="project-switch"></div>
   <div class="header-actions">
+    <a class="btn ghost" href="/users">Users</a>
     <button class="btn ghost" id="new-project-btn" type="button">New project</button>
     <button class="btn" id="new-task-btn" type="button">New task</button>
   </div>
@@ -527,6 +532,7 @@
 
   const state = {
     projects: [],
+    users: [],
     project: null,
     sprints: [],
     tasks: [],
@@ -571,6 +577,7 @@
 
   function parsePath() {
     const parts = location.pathname.split("/").filter(Boolean);
+    if (parts[0] === "users") return { route: null, section: "users" };
     if (parts[0] !== "p" || !parts[1]) return { route: null, section: "dashboard" };
     const route = parts[1];
     if (parts[2] === "backlog") return { route, section: "backlog" };
@@ -590,6 +597,19 @@
     try {
       const projects = await api("/api/projects");
       state.projects = projects.projects || [];
+      if (parsed.section === "users") {
+        const users = await api("/api/users");
+        state.users = users.users || [];
+        state.project = null;
+        state.tasks = [];
+        state.sprints = [];
+        state.specs = [];
+        state.changes = [];
+        state.events = [];
+        state.running = [];
+        render();
+        return;
+      }
       if (parsed.route) {
         state.project = await api(`/api/projects/${encodeURIComponent(parsed.route)}`);
         const [sprints, specs, changes, events] = await Promise.all([
@@ -637,8 +657,11 @@
     const select = document.getElementById("project-select");
     if (select) select.addEventListener("change", () => { if (select.value) location.href = `/p/${select.value}`; });
     newTaskBtn.classList.toggle("hidden", !state.project);
-    if (!state.project) navEl.innerHTML = "";
-    else {
+    if (!state.project) {
+      navEl.innerHTML = `
+        <a href="/" class="${state.view === "dashboard" ? "active" : ""}">Projects</a>
+        <a href="/users" class="${state.view === "users" ? "active" : ""}">Users</a>`;
+    } else {
       const route = state.project.route;
       const active = state.project.active_sprint?.number;
       const boardHref = active ? `/p/${route}/sprints/${active}` : `/p/${route}/sprints`;
@@ -661,6 +684,7 @@
   function render() {
     renderHeader();
     if (state.view === "dashboard") renderDashboard();
+    else if (state.view === "users") renderUsers();
     else if (state.view === "overview") renderOverview();
     else if (state.view === "board") renderBoard();
     else if (state.view === "backlog") renderBacklog();
@@ -692,6 +716,32 @@
         <button class="btn" data-action="new-project">Register project</button>
       </div>
       ${state.projects.length ? `<div class="grid">${projectCards()}</div>` : `<div class="empty-state">No projects yet. Register one to create a route.</div>`}`;
+  }
+
+  function renderUsers() {
+    const rows = state.users.map((u) => {
+      const scopes = u.projects.length
+        ? `<div class="scope-list">${u.projects.map((route) => `<span class="pill">${esc(route)}</span>`).join("")}</div>`
+        : `<span class="muted" style="color:var(--ink-3);font-size:12px">All projects (unrestricted)</span>`;
+      return `<div class="list-row">
+        <div class="body">
+          <h3>${esc(u.name)} <span class="badge">${esc(u.kind)}</span></h3>
+          <p><span style="font-family:var(--font-mono)">${esc(u.handle)}</span>${u.notes ? ` · ${esc(u.notes)}` : ""}</p>
+          <div style="margin-top:8px">${scopes}</div>
+        </div>
+        <div class="actions">
+          <button class="btn small ghost" data-action="edit-user" data-handle="${esc(u.handle)}">Edit</button>
+          <button class="btn small ghost" data-action="delete-user" data-handle="${esc(u.handle)}">Delete</button>
+        </div>
+      </div>`;
+    }).join("");
+    appEl.innerHTML = `
+      <div class="page-head">
+        <div><div class="crumbs"><a href="/">Projects</a> / <span>Users</span></div><h1>Users</h1><p>Agent and human profiles. Scoped users can only be assigned to their listed projects; unscoped users can work anywhere.</p></div>
+        <div class="spacer"></div>
+        <button class="btn" data-action="new-user">New user</button>
+      </div>
+      <div class="list">${rows || `<div class="empty-state">No users yet. Add your first profile to start assigning work.</div>`}</div>`;
   }
 
   function renderOverview() {
@@ -931,7 +981,45 @@
   }
 
   function formData() {
-    return Object.fromEntries(new FormData(modalFormEl).entries());
+    const data = {};
+    for (const [key, value] of new FormData(modalFormEl).entries()) {
+      if (!(key in data)) {
+        data[key] = value;
+      } else if (Array.isArray(data[key])) {
+        data[key].push(value);
+      } else {
+        data[key] = [data[key], value];
+      }
+    }
+    return data;
+  }
+
+  function openUserModal(user = null) {
+    const handleField = user
+      ? field("handle", "Handle", user.handle, "input", "disabled")
+      : field("handle", "Handle (lowercase slug)", "", "input", "required pattern='[a-z0-9]([a-z0-9_-]*[a-z0-9])?'");
+    const selected = new Set(user?.projects || []);
+    const projectChecks = state.projects.length
+      ? state.projects.map((p) => `<label class="check"><input type="checkbox" name="projects" value="${esc(p.route)}" ${selected.has(p.route) ? "checked" : ""}> <span>${esc(p.route)} — ${esc(p.name)}</span></label>`).join("")
+      : `<p class="muted">No projects registered yet.</p>`;
+    openModal(user ? `Edit ${user.handle}` : "New user", [
+      handleField,
+      field("name", "Display name", user?.name || "", "input", "required"),
+      field("kind", "Kind", `<option value="human" ${user?.kind !== "agent" ? "selected" : ""}>Human</option><option value="agent" ${user?.kind === "agent" ? "selected" : ""}>Agent</option>`, "select"),
+      field("notes", "Notes", user?.notes || "", "textarea"),
+      `<div class="field"><label>Project scope</label><div class="checks">${projectChecks}</div><p class="muted" style="margin:0">Leave all unchecked for unrestricted access.</p></div>`,
+    ].join(""), user ? "Save" : "Create", async (data) => {
+      const projects = data.projects === undefined ? [] : (Array.isArray(data.projects) ? data.projects : [data.projects]);
+      const payload = { name: data.name, kind: data.kind, notes: data.notes || "", projects };
+      if (user) {
+        await api(`/api/users/${encodeURIComponent(user.handle)}`, { method: "PATCH", body: JSON.stringify(payload) });
+        showToast(`updated ${user.handle}`);
+      } else {
+        payload.handle = data.handle;
+        await api("/api/users", { method: "POST", body: JSON.stringify(payload) });
+        showToast(`created ${data.handle}`);
+      }
+    });
   }
 
   newProjectBtn.addEventListener("click", () => {
@@ -1024,7 +1112,15 @@
       else if (action === "new-project") newProjectBtn.click();
       else if (action === "new-sprint") openSprintModal();
       else if (action === "new-spec") openSpecModal();
-      else if (action === "run") {
+      else if (action === "new-user") openUserModal();
+      else if (action === "edit-user") openUserModal(state.users.find((u) => u.handle === el.dataset.handle));
+      else if (action === "delete-user") {
+        const handle = el.dataset.handle;
+        if (!window.confirm(`Delete user ${handle}?`)) return;
+        await api(`/api/users/${encodeURIComponent(handle)}`, { method: "DELETE" });
+        showToast(`deleted ${handle}`);
+        await load();
+      } else if (action === "run") {
         el.disabled = true;
         await api(`/api/projects/${state.project.route}/tasks/${id}/run`, { method: "POST" });
         showToast(`#${id} dispatched`);

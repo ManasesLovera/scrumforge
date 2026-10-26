@@ -69,6 +69,30 @@ PROJECTS
     `route = \"acme\"` (and optionally `default_profile`).
 ";
 
+const USERS: &str = "\
+USERS
+    Profiles represent the humans and agents that tasks can be assigned to.
+    There is no authentication: this is local-only bookkeeping.
+
+      scrumforge user add dev-1 --name \"Dev One\" --kind agent --scope acme
+      scrumforge user add personal --name \"Manases\" --kind human
+      scrumforge user list [--scope acme]
+      scrumforge user show dev-1
+      scrumforge user set dev-1 --name \"Dev One\" --notes \"primary agent\"
+      scrumforge user scope dev-1 acme docs
+      scrumforge user unscope dev-1 docs
+      scrumforge user scope dev-1 --clear
+      scrumforge user rm dev-1 --yes
+
+    Handles are lowercase letters, digits, '-' and '_' (1-48 chars). A user
+    with one or more project scopes can only be assigned tasks in those
+    projects. A user with no scopes is unrestricted. Assignees that are not
+    registered users remain free-form (e.g. `developer`, `reviewer`), so
+    existing workflows keep working. `user list --scope <route>` shows the
+    users assignable to that project, and any handle can be used as
+    `--profile <handle>` for actor attribution.
+";
+
 const SPRINTS: &str = "\
 SPRINTS
     Work belongs to exactly one sprint. Only one sprint per project can be
@@ -159,8 +183,8 @@ COMMANDS
         Back up or verify the global SQLite store.
 
     scrumforge help [topic]
-        This guide. Topics: overview, lifecycle, projects, sprints, commands,
-        sdd, web, tui, repl, agents, files, requirements.
+        This guide. Topics: overview, lifecycle, projects, users, sprints,
+        commands, sdd, web, tui, repl, agents, files, requirements.
 
     scrumforge --help          terse usage summary
     scrumforge --version       print the version
@@ -194,6 +218,7 @@ WEB
     serves an embedded dashboard. It does not require a current project.
 
       /                              global project dashboard
+      /users                         user and project-scope management
       /p/<route>                     project overview
       /p/<route>/backlog             product backlog
       /p/<route>/sprints             sprint list
@@ -344,6 +369,7 @@ const TOPICS: &[(&str, Body)] = &[
     ("overview", || OVERVIEW.to_string()),
     ("lifecycle", || LIFECYCLE.to_string()),
     ("projects", || PROJECTS.to_string()),
+    ("users", || USERS.to_string()),
     ("sprints", || SPRINTS.to_string()),
     ("commands", || CLI.to_string()),
     ("sdd", || SDD.to_string()),
@@ -366,6 +392,7 @@ fn resolve(topic: &str) -> Option<Body> {
         "file" | "files" | "db" | "database" => "files",
         "requirements" | "install" | "setup" => "requirements",
         "project" | "route" | "routes" => "projects",
+        "user" | "users" | "profile" | "profiles" => "users",
         "sprint" | "backlog" => "sprints",
         "spec" | "specs" | "change" | "changes" => "sdd",
         "server" | "api" | "http" => "web",

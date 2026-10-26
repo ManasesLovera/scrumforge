@@ -106,6 +106,37 @@ pub fn validate_route(route: &str) -> Result<()> {
     Ok(())
 }
 
+pub fn validate_handle(handle: &str) -> Result<()> {
+    if handle.is_empty() || handle.len() > 48 {
+        bail!("user handle must be 1-48 characters");
+    }
+    if !handle
+        .chars()
+        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_')
+    {
+        bail!("user handle may contain only lowercase letters, digits, '-' and '_'");
+    }
+    if !handle
+        .chars()
+        .next()
+        .is_some_and(|c| c.is_ascii_alphanumeric())
+        || !handle
+            .chars()
+            .last()
+            .is_some_and(|c| c.is_ascii_alphanumeric())
+    {
+        bail!("user handle must start and end with a letter or digit");
+    }
+    Ok(())
+}
+
+pub fn parse_user_kind(value: &str) -> Result<String> {
+    match value {
+        "human" | "agent" => Ok(value.to_string()),
+        other => bail!("unknown user kind '{other}' (expected human or agent)"),
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct Binding {
     pub route: Option<String>,
