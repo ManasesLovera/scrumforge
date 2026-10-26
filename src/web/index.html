@@ -458,12 +458,12 @@
   .list-row h3 { margin: 0; font-size: 14px; }
   .list-row p { margin: 3px 0 0; color: var(--ink-2); font-size: 12px; }
   .list-row .actions { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
-  .board { height: auto; min-height: calc(100vh - 190px); padding: 0; }
+  .board { height: auto; min-height: calc(100vh - 190px); padding: 0; grid-template-columns: repeat(4, minmax(0, 1fr)); grid-auto-flow: row; }
   .board .column { max-height: none; }
   .spec-body { white-space: pre-wrap; font-family: var(--font-mono); font-size: 12px; line-height: 1.55; color: var(--ink-2); background: var(--sunken); border: 1px solid var(--line); border-radius: var(--r-sm); padding: 12px; overflow-x: auto; }
   .req { display: flex; gap: 8px; padding: 7px 0; border-bottom: 1px solid var(--line); font-size: 13px; }
   .req:last-child { border-bottom: 0; }
-  .req code { font-family: var(--font-mono); color: var(--ember); font-size: 11px; }
+  .req code { font-family: var(--font-mono); color: var(--ember); font-size: 11px; white-space: nowrap; flex: none; }
   .empty-state { text-align: center; padding: 40px 16px; color: var(--ink-3); border: 1px dashed var(--line-strong); border-radius: var(--r-md); }
   .modal { position: fixed; inset: 0; z-index: 50; display: grid; place-items: center; background: rgb(18 16 14 / 0.45); padding: 18px; }
   [hidden] { display: none !important; }
