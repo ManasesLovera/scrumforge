@@ -37,6 +37,22 @@ struct MoveReq {
 }
 
 #[derive(Deserialize)]
+struct UpdateTaskReq {
+    #[serde(default)]
+    title: Option<String>,
+    #[serde(default)]
+    description: Option<String>,
+    #[serde(default)]
+    acceptance_criteria: Option<String>,
+    #[serde(default)]
+    assignee: Option<String>,
+    #[serde(default)]
+    status: Option<String>,
+    #[serde(default)]
+    backlog: Option<bool>,
+}
+
+#[derive(Deserialize)]
 struct NewTask {
     title: String,
     #[serde(default)]
@@ -175,6 +191,10 @@ async fn serve(store: Store, port: u16) -> Result<()> {
         .route(
             "/api/projects/{route}/tasks",
             get(list_tasks).post(create_task),
+        )
+        .route(
+            "/api/projects/{route}/tasks/{id}",
+            get(get_task).patch(update_task),
         )
         .route("/api/projects/{route}/tasks/{id}/status", put(move_task))
         .route("/api/projects/{route}/tasks/{id}/run", post(run_task))
@@ -553,6 +573,118 @@ async fn create_task(
     Ok(Json(ops::task_json(&store, &task).map_err(internal)?))
 }
 
+fn event_json(event: &crate::board::Event) -> Value {
+    json!({
+        "id": event.id,
+        "actor": event.actor,
+        "verb": event.verb,
+        "task_id": event.task_id,
+        "sprint_id": event.sprint_id,
+        "from_status": event.from_status,
+        "to_status": event.to_status,
+        "detail": event.detail,
+        "ts": event.ts,
+    })
+}
+
+async fn get_task(
+    State(app): State<App>,
+    Path((route, id)): Path<(String, u32)>,
+) -> Result<Json<Value>, ApiError> {
+    let store = lock(&app.store);
+    let project = project_for(&store, &route)?;
+    let task = store
+        .task(project.id, id)
+        .map_err(internal)?
+        .ok_or_else(|| not_found(format!("task #{id} not found")))?;
+    let events = store.task_events(project.id, id, 100).map_err(internal)?;
+    Ok(Json(json!({
+        "task": ops::task_json(&store, &task).map_err(internal)?,
+        "events": events.iter().map(event_json).collect::<Vec<_>>(),
+    })))
+}
+
+async fn update_task(
+    State(app): State<App>,
+    Path((route, id)): Path<(String, u32)>,
+    Json(req): Json<UpdateTaskReq>,
+) -> Result<Json<Value>, ApiError> {
+    let store = lock(&app.store);
+    let project = project_for(&store, &route)?;
+    let mut task = store
+        .task(project.id, id)
+        .map_err(internal)?
+        .ok_or_else(|| not_found(format!("task #{id} not found")))?;
+
+    let mut edited = false;
+    if let Some(title) = req.title {
+        let title = title.trim();
+        if title.is_empty() {
+            return Err(bad("title cannot be empty"));
+        }
+        if task.title != title {
+            task.title = title.to_string();
+            edited = true;
+        }
+    }
+    if let Some(description) = req.description {
+        let description = description.trim();
+        if task.description != description {
+            task.description = description.to_string();
+            edited = true;
+        }
+    }
+    if let Some(acceptance_criteria) = req.acceptance_criteria {
+        let acceptance_criteria = acceptance_criteria.trim();
+        if task.acceptance_criteria != acceptance_criteria {
+            task.acceptance_criteria = acceptance_criteria.to_string();
+            edited = true;
+        }
+    }
+    if edited {
+        store.save_task(&task).map_err(internal)?;
+        store
+            .log_event(
+                project.id,
+                task.sprint_id,
+                Some(id),
+                "web",
+                "edited",
+                None,
+                None,
+                Some("task details updated"),
+            )
+            .map_err(internal)?;
+    }
+
+    if let Some(assignee) = req.assignee {
+        let who = assignee.trim();
+        if who.is_empty() || who.eq_ignore_ascii_case("unassigned") {
+            ops::unassign(&store, &project, id, "web").map_err(bad_err)?;
+        } else {
+            ops::assign(&store, &project, id, who, "web").map_err(bad_err)?;
+        }
+    }
+
+    if req.backlog.unwrap_or(false) {
+        ops::to_backlog(&store, &project, id, "web").map_err(bad_err)?;
+    } else if let Some(status) = req.status {
+        if status == "backlog" {
+            ops::to_backlog(&store, &project, id, "web").map_err(bad_err)?;
+        } else {
+            let target =
+                Status::from_db(&status).map_err(|_| bad(format!("unknown status: {status}")))?;
+            ops::move_task(&store, &project, id, &target, "web").map_err(bad_err)?;
+        }
+    }
+
+    let task = store
+        .task(project.id, id)
+        .map_err(internal)?
+        .ok_or_else(|| not_found(format!("task #{id} not found")))?;
+    Ok(Json(ops::task_json(&store, &task).map_err(internal)?))
+}
+
 async fn move_task(
     State(app): State<App>,
     Path((route, id)): Path<(String, u32)>,
@@ -561,9 +693,13 @@ async fn move_task(
     let store = lock(&app.store);
     let project = project_for(&store, &route)?;
     if let Some(status) = req.status.as_deref() {
-        let target =
-            Status::from_db(status).map_err(|_| bad(format!("unknown status: {status}")))?;
-        ops::move_task(&store, &project, id, &target, "web").map_err(bad_err)?;
+        if status == "backlog" {
+            ops::to_backlog(&store, &project, id, "web").map_err(bad_err)?;
+        } else {
+            let target =
+                Status::from_db(status).map_err(|_| bad(format!("unknown status: {status}")))?;
+            ops::move_task(&store, &project, id, &target, "web").map_err(bad_err)?;
+        }
     }
     if let Some(sprint) = req.sprint.as_deref() {
         if sprint == "backlog" {
@@ -845,21 +981,7 @@ async fn list_events(
     let store = lock(&app.store);
     let project = project_for(&store, &route)?;
     let events = store.events(project.id, 100).map_err(internal)?;
-    let values = events
-        .iter()
-        .map(|e| {
-            json!({
-                "id": e.id,
-                "actor": e.actor,
-                "verb": e.verb,
-                "task_id": e.task_id,
-                "sprint_id": e.sprint_id,
-                "from_status": e.from_status,
-                "to_status": e.to_status,
-                "detail": e.detail,
-                "ts": e.ts,
-            })
-        })
-        .collect::<Vec<_>>();
-    Ok(Json(json!({ "events": values })))
+    Ok(Json(
+        json!({ "events": events.iter().map(event_json).collect::<Vec<_>>() }),
+    ))
 }

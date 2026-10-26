@@ -902,6 +902,16 @@ impl Store {
             .context("listing events")
     }
 
+    pub fn task_events(&self, project_id: i64, task_id: u32, limit: u32) -> Result<Vec<Event>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, project_id, sprint_id, task_id, actor, verb, from_status, to_status, detail, ts
+             FROM events WHERE project_id = ?1 AND task_id = ?2 ORDER BY id DESC LIMIT ?3",
+        )?;
+        let rows = stmt.query_map(params![project_id, task_id, limit], event_from_row)?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .context("listing task events")
+    }
+
     pub fn users(&self) -> Result<Vec<User>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, handle, name, kind, notes, created_at, updated_at

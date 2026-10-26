@@ -276,6 +276,45 @@ pub fn assign(store: &Store, project: &Project, id: u32, who: &str, actor: &str)
     Ok(format!("task #{id} assigned to {who}"))
 }
 
+pub fn unassign(store: &Store, project: &Project, id: u32, actor: &str) -> Result<String> {
+    let task = store.update_task(project.id, id, |task| {
+        task.assignee = None;
+    })?;
+    event(
+        store,
+        project,
+        Some(id),
+        actor,
+        "unassigned",
+        Some(task.status.as_str()),
+        Some(task.status.as_str()),
+        None,
+    )?;
+    Ok(format!("task #{id} unassigned"))
+}
+
+pub fn to_backlog(store: &Store, project: &Project, id: u32, actor: &str) -> Result<String> {
+    let task = store
+        .task(project.id, id)?
+        .with_context(|| format!("task #{id} not found"))?;
+    let previous = task.status.clone();
+    let task = store.update_task(project.id, id, |task| {
+        task.status = Status::Backlog;
+        task.sprint_id = None;
+    })?;
+    event(
+        store,
+        project,
+        Some(id),
+        actor,
+        "moved",
+        Some(previous.as_str()),
+        Some(task.status.as_str()),
+        Some("returned to backlog"),
+    )?;
+    Ok(format!("task #{id} moved to backlog"))
+}
+
 pub fn review(
     store: &Store,
     project: &Project,

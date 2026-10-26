@@ -4,6 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>scrumforge</title>
+<link rel="icon" href="data:,">
 <style>
   :root {
     color-scheme: light dark;
@@ -483,6 +484,29 @@
   .check { display: flex; align-items: center; gap: 8px; font-size: 13px; color: var(--ink-2); }
   .check input { width: 15px; height: 15px; accent-color: var(--ember); }
   .scope-list { display: flex; flex-wrap: wrap; gap: 5px; }
+  .task-modal-card { width: min(96vw, 980px); }
+  .task-modal-head { display: flex; align-items: flex-start; gap: 16px; margin-bottom: 16px; }
+  .task-modal-head h2 { margin: 3px 0 0; font-size: 19px; letter-spacing: -0.01em; }
+  .task-modal-head .spacer { flex: 1; }
+  .task-modal-meta { font-family: var(--font-mono); font-size: 11px; color: var(--ink-3); }
+  .task-modal-grid { display: grid; grid-template-columns: minmax(0, 1.35fr) minmax(240px, 0.85fr); gap: 24px; }
+  .task-modal-side h3 { margin: 0 0 8px; font-size: 11px; text-transform: uppercase; letter-spacing: 0.05em; color: var(--ink-3); }
+  .task-details { display: grid; grid-template-columns: auto 1fr; gap: 7px 12px; margin: 0; font-size: 13px; }
+  .task-details dt { color: var(--ink-3); }
+  .task-details dd { margin: 0; overflow-wrap: anywhere; }
+  .task-details code { font-family: var(--font-mono); font-size: 11px; }
+  .task-activity { display: flex; flex-direction: column; gap: 8px; max-height: 330px; overflow-y: auto; }
+  .task-event { border-left: 2px solid var(--line-strong); padding: 1px 0 1px 10px; }
+  .task-event strong { font-size: 12px; text-transform: capitalize; }
+  .task-event time { margin-left: 6px; color: var(--ink-3); font-family: var(--font-mono); font-size: 10px; }
+  .task-event p { margin: 2px 0 0; color: var(--ink-2); font-size: 12px; overflow-wrap: anywhere; }
+  .task-modal-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 14px; padding-top: 14px; border-top: 1px solid var(--line); }
+  .task-modal-card .field textarea { min-height: 84px; }
+  .task-modal-card .field:last-child { margin-bottom: 0; }
+  @media (max-width: 780px) {
+    .task-modal-grid { grid-template-columns: 1fr; }
+    .task-modal-card { width: min(96vw, 640px); }
+  }
   @media (max-width: 720px) { .nav { padding: 0 10px; } .page { padding: 16px 12px 40px; } .header-actions .btn { padding: 6px 10px; } }
 </style>
 
@@ -510,6 +534,56 @@
     </form>
   </div>
 </div>
+<div class="modal" id="task-modal" hidden>
+  <div class="modal-card task-modal-card">
+    <div class="task-modal-head">
+      <div>
+        <div class="task-modal-meta" id="tm-meta"></div>
+        <h2 id="tm-heading"></h2>
+      </div>
+      <div class="spacer"></div>
+      <button class="btn ghost small" type="button" id="tm-close">Close</button>
+    </div>
+    <div class="task-modal-grid">
+      <section class="task-modal-main">
+        <div class="field">
+          <label for="tm-title">Title</label>
+          <input id="tm-title" name="title">
+        </div>
+        <div class="field">
+          <label for="tm-description">Description</label>
+          <textarea id="tm-description" name="description"></textarea>
+        </div>
+        <div class="field">
+          <label for="tm-acceptance">Acceptance criteria</label>
+          <textarea id="tm-acceptance" name="acceptance_criteria"></textarea>
+        </div>
+        <div class="row">
+          <div class="field grow">
+            <label for="tm-assignee">Assignee</label>
+            <select id="tm-assignee" name="assignee"></select>
+          </div>
+          <div class="field grow">
+            <label for="tm-status">Status</label>
+            <select id="tm-status" name="status"></select>
+          </div>
+        </div>
+        <div class="task-modal-actions">
+          <button class="btn" type="button" id="tm-save">Save changes</button>
+          <button class="btn ghost" type="button" id="tm-unassign">Unassign</button>
+          <button class="btn ghost" type="button" id="tm-backlog">Move to backlog</button>
+          <button class="btn ghost" type="button" id="tm-run">Run</button>
+        </div>
+      </section>
+      <aside class="task-modal-side">
+        <h3>Details</h3>
+        <dl class="task-details" id="tm-details"></dl>
+        <h3 style="margin-top:18px">Activity</h3>
+        <div class="task-activity" id="tm-activity"></div>
+      </aside>
+    </div>
+  </div>
+</div>
 <div class="toast" id="toast" role="status" aria-live="polite">
   <span class="toast-msg" id="toast-msg"></span>
   <button type="button" id="toast-action" hidden></button>
@@ -529,6 +603,21 @@
   const toastActionEl = document.getElementById("toast-action");
   const newProjectBtn = document.getElementById("new-project-btn");
   const newTaskBtn = document.getElementById("new-task-btn");
+  const taskModalEl = document.getElementById("task-modal");
+  const tmCloseEl = document.getElementById("tm-close");
+  const tmMetaEl = document.getElementById("tm-meta");
+  const tmHeadingEl = document.getElementById("tm-heading");
+  const tmTitleEl = document.getElementById("tm-title");
+  const tmDescriptionEl = document.getElementById("tm-description");
+  const tmAcceptanceEl = document.getElementById("tm-acceptance");
+  const tmAssigneeEl = document.getElementById("tm-assignee");
+  const tmStatusEl = document.getElementById("tm-status");
+  const tmDetailsEl = document.getElementById("tm-details");
+  const tmActivityEl = document.getElementById("tm-activity");
+  const tmSaveEl = document.getElementById("tm-save");
+  const tmUnassignEl = document.getElementById("tm-unassign");
+  const tmBacklogEl = document.getElementById("tm-backlog");
+  const tmRunEl = document.getElementById("tm-run");
 
   const state = {
     projects: [],
@@ -544,6 +633,8 @@
     sprintNumber: null,
     specSlug: null,
     modalSubmit: null,
+    currentTask: null,
+    currentTaskId: null,
   };
 
   let toastTimer = null;
@@ -834,6 +925,15 @@
         card.classList.remove("dragging");
         document.querySelectorAll(".drop-hover").forEach((el) => el.classList.remove("drop-hover"));
       });
+      card.addEventListener("click", (event) => {
+        if (event.target.closest("button, a, [data-action]")) return;
+        openTaskDetail(Number(card.dataset.id));
+      });
+      card.addEventListener("keydown", (event) => {
+        if (event.key !== "Enter" || event.target.closest("button, a")) return;
+        event.preventDefault();
+        openTaskDetail(Number(card.dataset.id));
+      });
     });
     document.querySelectorAll(".drop").forEach((drop) => {
       drop.addEventListener("dragover", (event) => {
@@ -1056,6 +1156,200 @@
     });
   }
 
+  const STATUS_LABELS = {
+    backlog: "Backlog",
+    todo: "To do",
+    "in-progress": "In progress",
+    "in-review": "In review",
+    "changes-requested": "Changes requested",
+    done: "Done",
+    cancelled: "Cancelled",
+  };
+
+  const STATUS_FLOW = {
+    backlog: ["cancelled"],
+    todo: ["backlog", "in-progress", "cancelled"],
+    "in-progress": ["todo", "in-review", "cancelled"],
+    "in-review": ["in-progress", "changes-requested", "done", "cancelled"],
+    "changes-requested": ["in-progress", "in-review", "cancelled"],
+    done: ["in-review", "cancelled"],
+  };
+
+  function statusLabel(status) {
+    return STATUS_LABELS[status] || status;
+  }
+
+  function statusChoices(current) {
+    return [...new Set([current, ...(STATUS_FLOW[current] || [])])];
+  }
+
+  function closeTaskDetail() {
+    taskModalEl.hidden = true;
+    state.currentTask = null;
+    state.currentTaskId = null;
+  }
+
+  async function openTaskDetail(id) {
+    if (!state.project) return;
+    const route = encodeURIComponent(state.project.route);
+    try {
+      const [detail, usersRes] = await Promise.all([
+        api(`/api/projects/${route}/tasks/${id}`),
+        api("/api/users").catch(() => ({ users: [] })),
+      ]);
+      const task = detail.task;
+      state.currentTask = task;
+      state.currentTaskId = task.id;
+
+      const sprintLabel = task.sprint ? `Sprint ${task.sprint.number} — ${task.sprint.name}` : "Backlog";
+      tmMetaEl.textContent = `#${task.id} · ${statusLabel(task.status)} · ${sprintLabel}`;
+      tmHeadingEl.textContent = task.title;
+      tmTitleEl.value = task.title || "";
+      tmDescriptionEl.value = task.description || "";
+      tmAcceptanceEl.value = task.acceptance_criteria || "";
+
+      const assignable = (usersRes.users || []).filter(
+        (u) => !u.projects.length || u.projects.includes(state.project.route),
+      );
+      const assigneeOptions = new Map([["", "Unassigned"], ["developer", "developer"], ["reviewer", "reviewer"]]);
+      for (const user of assignable) assigneeOptions.set(user.handle, `${user.name} (${user.handle})`);
+      const currentAssignee = task.assignee || "";
+      if (currentAssignee && !assigneeOptions.has(currentAssignee)) {
+        assigneeOptions.set(currentAssignee, currentAssignee);
+      }
+      tmAssigneeEl.innerHTML = [...assigneeOptions]
+        .map(([value, label]) => `<option value="${esc(value)}" ${value === currentAssignee ? "selected" : ""}>${esc(label)}</option>`)
+        .join("");
+
+      tmStatusEl.innerHTML = statusChoices(task.status)
+        .map((status) => `<option value="${esc(status)}" ${status === task.status ? "selected" : ""}>${esc(statusLabel(status))}</option>`)
+        .join("");
+
+      const detailRows = [
+        ["Status", `<span class="badge ${esc(task.status)}">${esc(task.status)}</span>`],
+        ["Sprint", task.sprint ? `Sprint ${esc(task.sprint.number)} — ${esc(task.sprint.name)}` : "Backlog"],
+        ["Assignee", task.assignee ? esc(task.assignee) : `<span class="muted">unassigned</span>`],
+        ["Branch", task.branch ? `<code>${esc(task.branch)}</code>` : ""],
+        ["Pull request", task.pr_url ? `<a class="pr" target="_blank" rel="noreferrer" href="${esc(task.pr_url)}">${esc(task.pr_url)}</a>` : ""],
+        ["Spec", task.spec_slug ? esc(task.spec_slug) : ""],
+        ["Requirement", task.requirement_key ? esc(task.requirement_key) : ""],
+        ["Estimate", task.estimate != null ? esc(task.estimate) : ""],
+        ["Created", esc(task.created_at)],
+        ["Updated", esc(task.updated_at)],
+        ["Review notes", task.review_notes ? esc(task.review_notes) : ""],
+      ].filter(([, value]) => value !== "" && value != null);
+      tmDetailsEl.innerHTML = detailRows.map(([label, value]) => `<dt>${label}</dt><dd>${value}</dd>`).join("");
+
+      const events = detail.events || [];
+      tmActivityEl.innerHTML = events.length
+        ? events.map((e) => {
+          const change = e.from_status && e.to_status ? ` · ${esc(e.from_status)} → ${esc(e.to_status)}` : "";
+          return `<div class="task-event"><strong>${esc(e.verb.replaceAll("-", " "))}</strong><time>${esc(e.ts)}</time><p>${esc(e.actor)}${change}${e.detail ? ` · ${esc(e.detail)}` : ""}</p></div>`;
+        }).join("")
+        : `<p class="muted">No activity recorded yet.</p>`;
+
+      const running = state.running.includes(task.id);
+      tmUnassignEl.disabled = !task.assignee;
+      tmBacklogEl.disabled = task.status === "backlog";
+      tmRunEl.disabled = running || task.status === "done";
+      tmRunEl.textContent = running ? "Running…" : "Run";
+      taskModalEl.hidden = false;
+    } catch (error) {
+      showToast(error.message, true);
+    }
+  }
+
+  async function patchTask(payload) {
+    const id = state.currentTaskId;
+    if (!id) return null;
+    return api(`/api/projects/${encodeURIComponent(state.project.route)}/tasks/${id}`, {
+      method: "PATCH",
+      body: JSON.stringify(payload),
+    });
+  }
+
+  async function saveTaskDetail() {
+    const task = state.currentTask;
+    if (!task) return;
+    const title = tmTitleEl.value.trim();
+    if (!title) {
+      showToast("title cannot be empty", true);
+      return;
+    }
+    const payload = {};
+    if (title !== task.title) payload.title = title;
+    const description = tmDescriptionEl.value.trim();
+    if (description !== (task.description || "")) payload.description = description;
+    const acceptance = tmAcceptanceEl.value.trim();
+    if (acceptance !== (task.acceptance_criteria || "")) payload.acceptance_criteria = acceptance;
+    const assignee = tmAssigneeEl.value;
+    if (assignee !== (task.assignee || "")) payload.assignee = assignee;
+    const status = tmStatusEl.value;
+    if (status !== task.status) payload.status = status;
+    if (!Object.keys(payload).length) {
+      showToast("no changes to save");
+      return;
+    }
+    try {
+      await patchTask(payload);
+      showToast(`#${task.id} updated`);
+      await load();
+      await openTaskDetail(task.id);
+    } catch (error) {
+      showToast(error.message, true);
+    }
+  }
+
+  async function unassignTaskDetail() {
+    const task = state.currentTask;
+    if (!task || !task.assignee) return;
+    try {
+      await patchTask({ assignee: "" });
+      showToast(`#${task.id} unassigned`);
+      await load();
+      await openTaskDetail(task.id);
+    } catch (error) {
+      showToast(error.message, true);
+    }
+  }
+
+  async function backlogTaskDetail() {
+    const task = state.currentTask;
+    if (!task) return;
+    try {
+      await patchTask({ backlog: true });
+      showToast(`#${task.id} moved to backlog`);
+      closeTaskDetail();
+      await load();
+    } catch (error) {
+      showToast(error.message, true);
+    }
+  }
+
+  async function runTaskDetail() {
+    const task = state.currentTask;
+    if (!task) return;
+    try {
+      tmRunEl.disabled = true;
+      await api(`/api/projects/${encodeURIComponent(state.project.route)}/tasks/${task.id}/run`, { method: "POST" });
+      showToast(`#${task.id} dispatched`);
+      closeTaskDetail();
+      await load();
+    } catch (error) {
+      showToast(error.message, true);
+      tmRunEl.disabled = false;
+    }
+  }
+
+  tmCloseEl.addEventListener("click", closeTaskDetail);
+  tmSaveEl.addEventListener("click", saveTaskDetail);
+  tmUnassignEl.addEventListener("click", unassignTaskDetail);
+  tmBacklogEl.addEventListener("click", backlogTaskDetail);
+  tmRunEl.addEventListener("click", runTaskDetail);
+  taskModalEl.addEventListener("click", (event) => {
+    if (event.target === taskModalEl) closeTaskDetail();
+  });
+
   function openSprintModal() {
     const p = state.project;
     openModal("New sprint", [
@@ -1153,13 +1447,15 @@
   });
 
   document.addEventListener("keydown", (event) => {
-    if (event.key === "Escape" && !modalEl.hidden) closeModal();
+    if (event.key !== "Escape") return;
+    if (!taskModalEl.hidden) closeTaskDetail();
+    else if (!modalEl.hidden) closeModal();
   });
 
   load();
   pollTimer = setInterval(() => {
     const focused = document.activeElement?.tagName;
-    if (document.hidden || !modalEl.hidden || draggingId !== null) return;
+    if (document.hidden || !modalEl.hidden || !taskModalEl.hidden || draggingId !== null) return;
     if (focused === "SELECT" || focused === "INPUT" || focused === "TEXTAREA") return;
     load();
   }, 3500);
