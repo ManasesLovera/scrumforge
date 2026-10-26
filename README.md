@@ -20,6 +20,16 @@ backlog ──plan──> todo ──> in-progress ──> in-review ──> don
                      └──── changes-requested <─┘
 ```
 
+## Screenshots
+
+![Global project dashboard](docs/screenshots/dashboard.png)
+
+![Sprint board with drag-and-drop columns](docs/screenshots/board.png)
+
+![Product backlog with sprint scheduling](docs/screenshots/backlog.png)
+
+![SDD spec detail with requirements and plan](docs/screenshots/sdd-spec.png)
+
 ## Requirements
 
 - Rust (to build), [opencode](https://opencode.ai) CLI (runs the agents)
