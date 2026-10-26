@@ -25,7 +25,7 @@ impl Status {
         }
     }
 
-    fn from_db(s: &str) -> Result<Status> {
+    pub(crate) fn from_db(s: &str) -> Result<Status> {
         Ok(match s {
             "backlog" => Status::Backlog,
             "assigned" => Status::Assigned,

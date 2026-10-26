@@ -37,6 +37,7 @@ its board (`.scrumforge.db`, SQLite) is used, so every project keeps its own tas
 ```bash
 scrumforge            # interactive TUI (humans)
 scrumforge repl       # line-oriented REPL
+scrumforge --web      # Trello-style web board at http://127.0.0.1:3030
 scrumforge help       # long-form guide to everything scrumforge does
 scrumforge --help     # terse usage summary
 ```
@@ -100,6 +101,7 @@ cargo build            # compile
 cargo clippy           # lint (kept warning-free)
 cargo run              # TUI (from a git repo)
 cargo run -- repl      # REPL
+cargo run -- --web     # web board at http://127.0.0.1:3030
 cargo run -- tasks     # CLI
 ```
 

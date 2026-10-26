@@ -4,6 +4,7 @@ mod cli;
 mod help;
 mod ops;
 mod repl;
+mod serve;
 mod tui;
 
 use anyhow::{bail, Result};
@@ -47,6 +48,10 @@ fn main() -> Result<()> {
             match args.first().map(String::as_str) {
                 None | Some("tui") => tui::run(board),
                 Some("repl") => repl::run(board),
+                Some("--web") | Some("serve") => {
+                    let port = serve::parse_port(&args[1..])?;
+                    serve::run(board, port)
+                }
                 Some(cmd) => cli::run(board, cmd, &args[1..]),
             }
         }

@@ -1,0 +1,387 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>scrumforge</title>
+<style>
+  :root {
+    --bg: #0e1016;
+    --panel: #161a24;
+    --panel-2: #1c2130;
+    --border: #262c3d;
+    --text: #e6e9f2;
+    --muted: #8b93a8;
+    --accent: #5b8cff;
+    --accent-soft: rgba(91, 140, 255, 0.18);
+    --danger: #ff6b6b;
+    --ok: #4ade80;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    min-height: 100vh;
+    background: radial-gradient(1200px 600px at 15% -10%, #1a2340 0%, var(--bg) 55%);
+    color: var(--text);
+    font: 14px/1.45 ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+  }
+  header {
+    display: flex;
+    align-items: center;
+    gap: 20px;
+    padding: 14px 20px;
+    border-bottom: 1px solid var(--border);
+    background: rgba(14, 16, 22, 0.82);
+    backdrop-filter: blur(8px);
+    position: sticky;
+    top: 0;
+    z-index: 10;
+    flex-wrap: wrap;
+  }
+  .brand { font-size: 18px; font-weight: 700; letter-spacing: -0.02em; }
+  .brand span { color: var(--accent); }
+  .repo { color: var(--muted); font-size: 12px; max-width: 420px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  form { display: flex; gap: 8px; margin-left: auto; flex: 1; justify-content: flex-end; min-width: 320px; }
+  input {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    color: var(--text);
+    border-radius: 8px;
+    padding: 8px 11px;
+    font: inherit;
+    outline: none;
+  }
+  input:focus { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }
+  #new-title { width: 220px; }
+  #new-desc { width: 260px; }
+  button {
+    cursor: pointer;
+    border: 1px solid transparent;
+    border-radius: 8px;
+    padding: 8px 14px;
+    font: inherit;
+    font-weight: 600;
+    color: #fff;
+    background: var(--accent);
+  }
+  button:hover { filter: brightness(1.08); }
+  button:disabled { opacity: 0.55; cursor: default; filter: none; }
+  .board {
+    display: flex;
+    gap: 14px;
+    align-items: flex-start;
+    padding: 20px;
+    overflow-x: auto;
+    min-height: calc(100vh - 70px);
+  }
+  .column {
+    flex: 0 0 278px;
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    display: flex;
+    flex-direction: column;
+    max-height: calc(100vh - 48px);
+  }
+  .column h2 {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin: 0;
+    padding: 12px 14px;
+    font-size: 12px;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--muted);
+    border-bottom: 1px solid var(--border);
+  }
+  .count { background: var(--panel-2); color: var(--text); border-radius: 999px; padding: 1px 8px; font-size: 11px; }
+  .drop {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    padding: 10px;
+    min-height: 90px;
+    overflow-y: auto;
+    transition: background 120ms ease, outline-color 120ms ease;
+    outline: 2px dashed transparent;
+    outline-offset: -4px;
+    border-radius: 0 0 12px 12px;
+  }
+  .drop.drop-hover { background: var(--accent-soft); outline-color: var(--accent); }
+  .empty { color: var(--muted); font-size: 12px; text-align: center; padding: 18px 0; }
+  .card {
+    background: var(--panel-2);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 11px 12px;
+    cursor: grab;
+    box-shadow: 0 4px 14px rgba(0, 0, 0, 0.22);
+  }
+  .card:hover { border-color: #3a4258; }
+  .card.dragging { opacity: 0.35; cursor: grabbing; }
+  .card-top { display: flex; justify-content: space-between; align-items: center; gap: 8px; font-size: 11px; color: var(--muted); }
+  .card-top .who { color: var(--accent); font-weight: 600; }
+  .card h3 { margin: 6px 0 4px; font-size: 14px; line-height: 1.35; font-weight: 600; }
+  .card p { margin: 0; color: var(--muted); font-size: 12px; }
+  .card .notes { margin-top: 8px; padding-top: 8px; border-top: 1px solid var(--border); color: #f0b96b; }
+  .card .actions { display: flex; align-items: center; gap: 10px; margin-top: 10px; }
+  .card .actions button { padding: 4px 10px; font-size: 12px; background: transparent; border-color: var(--border); color: var(--text); }
+  .card .actions button:hover { border-color: var(--accent); color: var(--accent); }
+  .card .actions a { color: var(--accent); font-size: 12px; text-decoration: none; }
+  .card .actions a:hover { text-decoration: underline; }
+  .toast {
+    position: fixed;
+    left: 50%;
+    bottom: 24px;
+    transform: translate(-50%, 20px);
+    background: #222a3d;
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 10px 16px;
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity 160ms ease, transform 160ms ease;
+    max-width: min(90vw, 520px);
+    box-shadow: 0 12px 30px rgba(0, 0, 0, 0.4);
+  }
+  .toast.show { opacity: 1; transform: translate(-50%, 0); }
+  .toast.error { border-color: var(--danger); color: #ffd4d4; }
+  @media (max-width: 720px) {
+    form { min-width: 100%; }
+    #new-title, #new-desc { width: 100%; }
+  }
+</style>
+</head>
+<body>
+<header>
+  <div class="brand">scrum<span>forge</span></div>
+  <div class="repo" id="repo"></div>
+  <form id="add-form" autocomplete="off">
+    <input id="new-title" placeholder="New task title" required>
+    <input id="new-desc" placeholder="Description (optional)">
+    <button type="submit">Add task</button>
+  </form>
+</header>
+<main class="board" id="board"></main>
+<div class="toast" id="toast"></div>
+<script>
+  const COLUMNS = [
+    ["backlog", "Backlog"],
+    ["assigned", "Assigned"],
+    ["in-progress", "In Progress"],
+    ["in-review", "Review"],
+    ["changes-requested", "Changes Requested"],
+    ["done", "Done"],
+  ];
+
+  const boardEl = document.getElementById("board");
+  const repoEl = document.getElementById("repo");
+  const toastEl = document.getElementById("toast");
+  const formEl = document.getElementById("add-form");
+  const titleEl = document.getElementById("new-title");
+  const descEl = document.getElementById("new-desc");
+
+  let snapshot = { repo: "", tasks: [], running: [], error: null };
+  let draggingId = null;
+  let toastTimer = null;
+  let lastError = null;
+
+  function esc(value) {
+    return String(value ?? "").replace(/[&<>"']/g, (ch) => ({
+      "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;",
+    })[ch]);
+  }
+
+  function label(status) {
+    const found = COLUMNS.find(([key]) => key === status);
+    return found ? found[1] : status;
+  }
+
+  function cardHtml(task) {
+    const running = snapshot.running.includes(task.id);
+    const pr = task.pr_url
+      ? `<a href="${esc(task.pr_url)}" target="_blank" rel="noreferrer">PR</a>`
+      : "";
+    const description = task.description
+      ? `<p>${esc(task.description)}</p>`
+      : "";
+    const notes = task.review_notes
+      ? `<p class="notes">${esc(task.review_notes)}</p>`
+      : "";
+    return `
+      <article class="card" draggable="true" data-id="${task.id}">
+        <div class="card-top">
+          <span>#${task.id}</span>
+          <span class="who">${esc(task.assignee || "unassigned")}</span>
+        </div>
+        <h3>${esc(task.title)}</h3>
+        ${description}
+        ${notes}
+        <div class="actions">
+          <button data-run="${task.id}" ${running ? "disabled" : ""}>${running ? "Running…" : "Run"}</button>
+          ${pr}
+        </div>
+      </article>`;
+  }
+
+  function columnHtml(key, title, tasks) {
+    const cards = tasks.length
+      ? tasks.map(cardHtml).join("")
+      : `<div class="empty">Drop tasks here</div>`;
+    return `
+      <section class="column">
+        <h2>${title}<span class="count">${tasks.length}</span></h2>
+        <div class="drop" data-status="${key}">${cards}</div>
+      </section>`;
+  }
+
+  function render() {
+    boardEl.innerHTML = COLUMNS.map(([key, title]) =>
+      columnHtml(key, title, snapshot.tasks.filter((task) => task.status === key))
+    ).join("");
+    repoEl.textContent = snapshot.repo;
+    wire();
+    if (snapshot.error && snapshot.error !== lastError) {
+      lastError = snapshot.error;
+      showToast(snapshot.error, true);
+    }
+  }
+
+  function wire() {
+    boardEl.querySelectorAll(".card").forEach((card) => {
+      card.addEventListener("dragstart", (event) => {
+        draggingId = Number(card.dataset.id);
+        card.classList.add("dragging");
+        event.dataTransfer.effectAllowed = "move";
+        event.dataTransfer.setData("text/plain", card.dataset.id);
+      });
+      card.addEventListener("dragend", () => {
+        draggingId = null;
+        card.classList.remove("dragging");
+        clearDropHints();
+      });
+    });
+
+    boardEl.querySelectorAll("[data-run]").forEach((button) => {
+      button.addEventListener("click", () => runTask(button));
+    });
+
+    boardEl.querySelectorAll(".drop").forEach((zone) => {
+      zone.addEventListener("dragover", (event) => {
+        if (draggingId === null) return;
+        event.preventDefault();
+        event.dataTransfer.dropEffect = "move";
+        zone.classList.add("drop-hover");
+      });
+      zone.addEventListener("dragleave", (event) => {
+        if (!zone.contains(event.relatedTarget)) zone.classList.remove("drop-hover");
+      });
+      zone.addEventListener("drop", (event) => {
+        event.preventDefault();
+        clearDropHints();
+        if (draggingId === null) return;
+        const id = draggingId;
+        draggingId = null;
+        moveTask(id, zone.dataset.status);
+      });
+    });
+  }
+
+  function clearDropHints() {
+    boardEl.querySelectorAll(".drop-hover").forEach((zone) => {
+      zone.classList.remove("drop-hover");
+    });
+  }
+
+  function showToast(message, isError) {
+    toastEl.textContent = message;
+    toastEl.className = `toast show${isError ? " error" : ""}`;
+    clearTimeout(toastTimer);
+    toastTimer = setTimeout(() => {
+      toastEl.className = "toast";
+    }, 4000);
+  }
+
+  async function moveTask(id, status) {
+    const task = snapshot.tasks.find((candidate) => candidate.id === id);
+    if (!task || task.status === status) {
+      render();
+      return;
+    }
+    const previous = task.status;
+    task.status = status;
+    render();
+    try {
+      const response = await fetch(`/api/tasks/${id}/status`, {
+        method: "PUT",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ status }),
+      });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.error || `HTTP ${response.status}`);
+      showToast(`#${id} moved to ${label(status)}`);
+    } catch (error) {
+      task.status = previous;
+      render();
+      showToast(error.message, true);
+    }
+    load();
+  }
+
+  async function runTask(button) {
+    const id = button.dataset.run;
+    button.disabled = true;
+    button.textContent = "Running…";
+    try {
+      const response = await fetch(`/api/tasks/${id}/run`, { method: "POST" });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.error || `HTTP ${response.status}`);
+      showToast(`#${id} dispatched`);
+    } catch (error) {
+      button.disabled = false;
+      button.textContent = "Run";
+      showToast(error.message, true);
+    }
+    load();
+  }
+
+  async function load() {
+    if (draggingId !== null || document.hidden) return;
+    try {
+      const response = await fetch("/api/tasks");
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      snapshot = await response.json();
+      if (!snapshot.error) lastError = null;
+    } catch (error) {
+      snapshot.error = error.message;
+    }
+    render();
+  }
+
+  formEl.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const title = titleEl.value.trim();
+    if (!title) return;
+    try {
+      const response = await fetch("/api/tasks", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ title, description: descEl.value.trim() }),
+      });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.error || `HTTP ${response.status}`);
+      titleEl.value = "";
+      descEl.value = "";
+      showToast(`added #${data.id}`);
+    } catch (error) {
+      showToast(error.message, true);
+    }
+    load();
+  });
+
+  load();
+  setInterval(load, 2500);
+</script>
+</body>
+</html>

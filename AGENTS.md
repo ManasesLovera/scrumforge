@@ -35,11 +35,14 @@ needs an interactive terminal.
 ## Architecture
 
 - `src/main.rs` — startup: validates cwd is a git repo, loads the board,
-  dispatches to `tui` (default) or `repl` subcommand.
+  dispatches to `tui` (default), `repl`, or the `--web`/`serve` HTTP frontend.
 - `src/ops.rs` — shared actions (`request`, `run_task`, `rework`,
   `add_backlog_task`) used by both frontends. Returns human-readable result
   strings.
 - `src/repl.rs` — line-oriented REPL (rustyline).
+- `src/serve.rs` — axum HTTP frontend (`--web`/`serve`, loopback only). Serves an
+  embedded drag-and-drop board (`src/web/index.html`) plus JSON endpoints for
+  listing/creating tasks, moving status, and spawning `run_task` on a thread.
 - `src/tui.rs` — interactive terminal UI (ratatui + crossterm): five status
   columns, detail pane, vim-style keys (`hjkl`/arrows, `r` run, `w` rework,
   `R` request, `a` add, `:` command mode, `?` help). Long agent runs are queued

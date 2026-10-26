@@ -15,6 +15,8 @@ USAGE:
 COMMANDS:
     (no command)                interactive TUI (humans)
     repl                        interactive line REPL (humans)
+    --web [--port <n>]          web board in the browser (default port 3030)
+    serve [--port <n>]          alias for --web
 
     Non-interactive CLI (for scripts and AI agents):
       backlog <title> [| <description>]   add a task directly
