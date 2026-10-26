@@ -4,56 +4,61 @@ mod cli;
 mod help;
 mod ops;
 mod repl;
+mod resolve;
 mod serve;
 mod tui;
 
-use anyhow::{bail, Result};
-use board::Board;
-use std::path::PathBuf;
+use anyhow::{Result, bail};
+use board::Store;
 
-fn find_repo_root() -> Result<PathBuf> {
-    let mut dir = std::env::current_dir()?;
-    loop {
-        if dir.join(".git").exists() {
-            return Ok(dir);
+fn main() -> Result<()> {
+    let raw: Vec<String> = std::env::args().skip(1).collect();
+    if matches!(raw.first().map(String::as_str), Some("-h") | Some("--help")) {
+        println!("{}", cli::HELP);
+        return Ok(());
+    }
+    if matches!(
+        raw.first().map(String::as_str),
+        Some("-V") | Some("--version")
+    ) {
+        println!("scrumforge {}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
+    if raw.first().map(String::as_str) == Some("help") {
+        help::print(&raw[1..]);
+        return Ok(());
+    }
+
+    let (globals, rest) = cli::parse_globals(raw)?;
+    let db_path = globals.db.clone().unwrap_or_else(resolve::default_db_path);
+    let store = Store::open(&db_path)?;
+
+    match rest.first().map(String::as_str) {
+        Some("help") => {
+            help::print(&rest[1..]);
+            Ok(())
         }
-        if !dir.pop() {
-            bail!(
-                "not inside a git repository (looked up from {})",
-                std::env::current_dir()?.display()
-            );
+        Some("tui") => {
+            let project = resolve::resolve_project(&store, globals.project.as_deref(), true)?;
+            tui::run(store, project)
         }
+        Some("repl") => {
+            let project = resolve::resolve_project(&store, globals.project.as_deref(), true)?;
+            repl::run(store, project)
+        }
+        Some("--web") | Some("serve") => {
+            let port = serve::parse_port(&rest[1..])?;
+            serve::run(store, port)
+        }
+        None => {
+            let project = resolve::resolve_project(&store, globals.project.as_deref(), true)?;
+            tui::run(store, project)
+        }
+        Some(_) => cli::run(&store, &globals, &rest),
     }
 }
 
-fn main() -> Result<()> {
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    match args.first().map(String::as_str) {
-        Some("-h") | Some("--help") => {
-            println!("{}", cli::HELP);
-            Ok(())
-        }
-        Some("help") => {
-            help::print(&args[1..]);
-            Ok(())
-        }
-        Some("-V") | Some("--version") => {
-            println!("scrumforge {}", env!("CARGO_PKG_VERSION"));
-            Ok(())
-        }
-        _ => {
-            let repo_path = find_repo_root()?;
-            let board_file: PathBuf = repo_path.join(".scrumforge.db");
-            let board = Board::open(&board_file, repo_path.clone())?;
-            match args.first().map(String::as_str) {
-                None | Some("tui") => tui::run(board),
-                Some("repl") => repl::run(board),
-                Some("--web") | Some("serve") => {
-                    let port = serve::parse_port(&args[1..])?;
-                    serve::run(board, port)
-                }
-                Some(cmd) => cli::run(board, cmd, &args[1..]),
-            }
-        }
-    }
+#[allow(dead_code)]
+fn unreachable_bail() -> Result<()> {
+    bail!("unreachable")
 }

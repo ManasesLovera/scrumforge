@@ -1,20 +1,29 @@
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use crate::board::{Board, Status, Task};
+use crate::board::{Project, Status, Store, Task};
 
-/// Run a non-interactive opencode agent turn in `workdir` and return its text reply.
-pub fn ask_agent(role: &str, workdir: &Path, prompt: &str) -> Result<String> {
+fn ask_agent(
+    role: &str,
+    workdir: &Path,
+    prompt: &str,
+    project: &Project,
+    actor: &str,
+) -> Result<String> {
     let full_prompt = format!(
         "You are the {role} on a scrum team. Reply with a single JSON object, \
-         no markdown fences, no extra text. {prompt}"
+         no markdown fences, no extra text. The project route is `{}`; always pass \
+         `--project {}` to scrumforge. {prompt}",
+        project.route, project.route
     );
     let out = Command::new("opencode")
         .arg("run")
         .arg(&full_prompt)
         .current_dir(workdir)
+        .env("SCRUMFORGE_PROJECT", &project.route)
+        .env("SCRUMFORGE_PROFILE", actor)
         .output()
         .context("spawning opencode")?;
     if !out.status.success() {
@@ -27,7 +36,6 @@ pub fn ask_agent(role: &str, workdir: &Path, prompt: &str) -> Result<String> {
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
-/// Extract the first JSON object from agent output.
 fn parse_json(reply: &str) -> Result<Value> {
     let start = reply
         .find('{')
@@ -38,22 +46,8 @@ fn parse_json(reply: &str) -> Result<Value> {
     serde_json::from_str(&reply[start..=end]).context("parsing agent JSON reply")
 }
 
-fn worktree_root(repo_path: &Path, branch: &str) -> PathBuf {
-    let name = repo_path
-        .file_name()
-        .map(|n| n.to_string_lossy().to_string())
-        .unwrap_or_else(|| "project".into());
-    home_worktrees().join(name).join(branch)
-}
-
-fn home_worktrees() -> PathBuf {
-    home_dir().join("dev").join("worktrees")
-}
-
-fn home_dir() -> PathBuf {
-    std::env::var("HOME")
-        .map(PathBuf::from)
-        .expect("HOME not set")
+pub fn worktree_path(project: &Project, branch: &str) -> PathBuf {
+    project.worktree_root.join(&project.route).join(branch)
 }
 
 fn run(cmd: &str, args: &[&str], dir: &Path) -> Result<String> {
@@ -73,25 +67,32 @@ fn run(cmd: &str, args: &[&str], dir: &Path) -> Result<String> {
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
-/// Scrum master: break the PO's request into concrete tasks and assign each to
-/// developer or reviewer. Returns list of (title, description, assignee).
-pub fn scrum_master_plan(board: &Board, request: &str) -> Result<Vec<(String, String, String)>> {
+pub fn scrum_master_plan(
+    store: &Store,
+    project: &Project,
+    request: &str,
+    actor: &str,
+) -> Result<Vec<(String, String, String)>> {
+    let open = store
+        .tasks(project.id)?
+        .into_iter()
+        .filter(|t| t.status != Status::Done)
+        .map(|t| format!("#{} {} [{}]", t.id, t.title, t.status))
+        .collect::<Vec<_>>()
+        .join("; ");
     let prompt = format!(
         "The product owner says: \"{request}\"\
-         \nExisting open tasks: {}\
-         \nBreak this into 1-4 concrete engineering tasks. Avoid duplicating open tasks. \
-         Respond as JSON: {{\"tasks\":[{{\"title\":\"...\",\"description\":\"...\",\"assignee\":\"developer\"}}]}} \
+         \nProject: {} ({}). Methodology: scrum.\
+         \nExisting open tasks: {open}\
+         \nBreak this into 1-4 concrete engineering tasks in the product backlog. \
+         Avoid duplicating open tasks. Respond as JSON: \
+         {{\"tasks\":[{{\"title\":\"...\",\"description\":\"...\",\
+         \"acceptance_criteria\":\"...\",\"assignee\":\"developer\"}}]}} \
          where assignee is \"developer\" for implementation tasks (most tasks) or \
          \"reviewer\" for review-only/audit tasks.",
-        board
-            .tasks()
-            .iter()
-            .filter(|t| t.status != Status::Done)
-            .map(|t| format!("#{} {} [{}]", t.id, t.title, t.status))
-            .collect::<Vec<_>>()
-            .join("; "),
+        project.route, project.name
     );
-    let reply = ask_agent("SCRUM MASTER", &board.repo_path, &prompt)?;
+    let reply = ask_agent("SCRUM MASTER", &project.repo_path, &prompt, project, actor)?;
     let v = parse_json(&reply)?;
     let mut out = Vec::new();
     for t in v
@@ -99,118 +100,317 @@ pub fn scrum_master_plan(board: &Board, request: &str) -> Result<Vec<(String, St
         .and_then(|t| t.as_array())
         .context("scrum master reply missing tasks array")?
     {
-        let title = t.get("title").and_then(|x| x.as_str()).unwrap_or("").to_string();
+        let title = t
+            .get("title")
+            .and_then(|x| x.as_str())
+            .unwrap_or("")
+            .to_string();
         let desc = t
             .get("description")
             .and_then(|x| x.as_str())
             .unwrap_or("")
             .to_string();
-        let assignee = match t.get("assignee").and_then(|x| x.as_str()).unwrap_or("developer") {
+        let criteria = t
+            .get("acceptance_criteria")
+            .map(|x| match x {
+                Value::Array(items) => items
+                    .iter()
+                    .filter_map(|v| v.as_str())
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+                Value::String(s) => s.clone(),
+                _ => String::new(),
+            })
+            .unwrap_or_default();
+        let assignee = match t
+            .get("assignee")
+            .and_then(|x| x.as_str())
+            .unwrap_or("developer")
+        {
             "reviewer" => "reviewer",
             _ => "developer",
         }
         .to_string();
         if !title.is_empty() {
+            let desc = if criteria.is_empty() {
+                desc
+            } else {
+                format!("{desc}\n\nAcceptance criteria:\n{criteria}")
+            };
             out.push((title, desc, assignee));
         }
     }
     Ok(out)
 }
 
-/// Developer agent: create a worktree, implement, commit, push, open PR.
-pub fn developer_work(board: &Board, id: u32) -> Result<()> {
-    let task = board.get(id).context("task not found")?;
+pub struct SpecDraft {
+    pub slug: String,
+    pub title: String,
+    pub summary: String,
+    pub body_md: String,
+    pub plan_md: String,
+    pub requirements: Vec<crate::board::Requirement>,
+}
+
+pub fn sdd_spec_draft(project: &Project, request: &str, actor: &str) -> Result<SpecDraft> {
+    let prompt = format!(
+        "The product owner requests: \"{request}\"\
+         \nProject: {} ({}). Methodology: sdd.\
+         \nCreate a draft specification, a technical plan, and a short list of testable \
+         requirements. Respond as JSON: \
+         {{\"spec\":{{\"slug\":\"kebab-case\",\"title\":\"...\",\"summary\":\"...\",\
+         \"body\":\"markdown\",\"requirements\":[{{\"key\":\"R-1\",\"kind\":\"functional\",\
+         \"text\":\"...\"}}]}},\"plan\":{{\"approach\":\"...\",\"risks\":[\"...\"],\
+         \"test_strategy\":\"...\"}}}}",
+        project.route, project.name
+    );
+    let reply = ask_agent("SPEC PLANNER", &project.repo_path, &prompt, project, actor)?;
+    let v = parse_json(&reply)?;
+    let spec = v.get("spec").context("spec planner reply missing spec")?;
+    let title = spec
+        .get("title")
+        .and_then(|x| x.as_str())
+        .unwrap_or("Untitled spec")
+        .to_string();
+    let slug = spec
+        .get("slug")
+        .and_then(|x| x.as_str())
+        .map(slugify)
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| slugify(&title));
+    let summary = spec
+        .get("summary")
+        .and_then(|x| x.as_str())
+        .unwrap_or("")
+        .to_string();
+    let body = spec
+        .get("body")
+        .and_then(|x| x.as_str())
+        .unwrap_or("")
+        .to_string();
+    let requirements = spec
+        .get("requirements")
+        .and_then(|x| x.as_array())
+        .map(|items| {
+            items
+                .iter()
+                .enumerate()
+                .map(|(i, r)| crate::board::Requirement {
+                    key: r
+                        .get("key")
+                        .and_then(|x| x.as_str())
+                        .map(str::to_string)
+                        .unwrap_or_else(|| format!("R-{}", i + 1)),
+                    text: r
+                        .get("text")
+                        .and_then(|x| x.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                    kind: r
+                        .get("kind")
+                        .and_then(|x| x.as_str())
+                        .unwrap_or("functional")
+                        .to_string(),
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let plan = v.get("plan").cloned().unwrap_or(Value::Null);
+    let plan_md = plan
+        .get("approach")
+        .and_then(|x| x.as_str())
+        .unwrap_or("")
+        .to_string();
+    Ok(SpecDraft {
+        slug,
+        title,
+        summary,
+        body_md: body,
+        plan_md,
+        requirements,
+    })
+}
+
+pub fn slugify(value: &str) -> String {
+    let mut out = String::new();
+    let mut dash = false;
+    for c in value.chars().flat_map(char::to_lowercase) {
+        if c.is_ascii_alphanumeric() {
+            out.push(c);
+            dash = false;
+        } else if !dash && !out.is_empty() {
+            out.push('-');
+            dash = true;
+        }
+    }
+    out.trim_matches('-').to_string()
+}
+
+pub fn developer_work(store: &Store, project: &Project, id: u32, actor: &str) -> Result<()> {
+    let task = store
+        .task(project.id, id)?
+        .with_context(|| format!("task #{id} not found"))?;
     if task.status == Status::Done {
         bail!("task #{id} is already done");
     }
-    let branch = task.branch.clone().unwrap_or_else(|| format!("scrumforge/task-{id}"));
-    let wt = worktree_root(&board.repo_path, &branch);
+    let branch = task
+        .branch
+        .clone()
+        .unwrap_or_else(|| format!("scrumforge/task-{id}"));
+    let wt = worktree_path(project, &branch);
 
     if !wt.exists() {
         run(
             "git",
-            &["worktree", "add", "-b", &branch, wt.to_string_lossy().as_ref(), "main"],
-            &board.repo_path,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                &branch,
+                wt.to_string_lossy().as_ref(),
+                &project.default_branch,
+            ],
+            &project.repo_path,
         )?;
     }
-    board.update(id, |t| {
+    store.update_task(project.id, id, |t| {
         t.branch = Some(branch.clone());
-        t.status = Status::InProgress;
-        t.assignee = Some("developer".into());
+        t.assignee = Some(actor.to_string());
     })?;
 
+    let spec_hint = task
+        .spec_slug
+        .as_deref()
+        .map(|s| format!("Spec: {s}\n"))
+        .unwrap_or_default();
+    let criteria = if task.acceptance_criteria.is_empty() {
+        String::new()
+    } else {
+        format!("\nAcceptance criteria:\n{}\n", task.acceptance_criteria)
+    };
+    let sprint_label = match task.sprint_id {
+        Some(sprint_id) => store
+            .sprints(project.id)?
+            .into_iter()
+            .find(|s| s.id == sprint_id)
+            .map(|s| s.number.to_string())
+            .unwrap_or_else(|| sprint_id.to_string()),
+        None => "backlog".into(),
+    };
     let prompt = format!(
-        "Implement this task in the current git worktree: \
-         \nTitle: {}\
+        "Implement this task in the current git worktree.\
+         \nProject: {} (route {}). Sprint: {}.\
+         \n{spec_hint}Title: {}\
          \nDescription: {}\
-         \nSteps: 1) implement the change 2) run any available tests/linters and fix issues \
-         3) stage and commit ALL your changes with a Conventional Commit message. \
+         {criteria}\
+         \nSteps: 1) implement the change 2) run available tests/linters and fix issues \
+         3) stage and commit ALL changes with a Conventional Commit message. \
          Do NOT push or create a PR. \
-         Respond as JSON: {{\"summary\":\"...\",\"commit\":\"<commit-sha>\",\"files_changed\":n}}",
-        task.title, task.description,
+         Respond as JSON: {{\"summary\":\"...\",\"commit\":\"<sha>\",\"files_changed\":n}}",
+        project.name, project.route, sprint_label, task.title, task.description,
     );
-    let reply = ask_agent("DEVELOPER", &wt, &prompt)?;
+    let reply = ask_agent("DEVELOPER", &wt, &prompt, project, actor)?;
     let v = parse_json(&reply)?;
 
     run("git", &["push", "-u", "origin", &branch], &wt)?;
     let title = format!("feat(task-{id}): {}", task.title);
     let body = format!(
-        "Closes scrum task #{}: {}\n\n{}\n\nDeveloper summary: {}",
+        "Closes scrum task #{} in project `{}`: {}\n\n{}\n\nDeveloper summary: {}",
         id,
+        project.route,
         task.title,
         task.description,
         v.get("summary").and_then(|x| x.as_str()).unwrap_or("")
     );
     let pr_url = run(
         "gh",
-        &["pr", "create", "--title", &title, "--body", &body, "--base", "main"],
+        &[
+            "pr",
+            "create",
+            "--title",
+            &title,
+            "--body",
+            &body,
+            "--base",
+            &project.default_branch,
+        ],
         &wt,
     )?;
 
-    board.update(id, |t| {
+    store.update_task(project.id, id, |t| {
         t.status = Status::InReview;
         t.pr_url = Some(pr_url);
     })?;
     Ok(())
 }
 
-/// Reviewer agent: inspect the PR, approve+merge or send back.
-pub fn reviewer_work(board: &Board, id: u32) -> Result<()> {
-    let task = board.get(id).context("task not found")?;
+pub fn reviewer_work(store: &Store, project: &Project, id: u32, actor: &str) -> Result<()> {
+    let task = store
+        .task(project.id, id)?
+        .with_context(|| format!("task #{id} not found"))?;
     let Some(pr_url) = task.pr_url.clone() else {
         bail!("task #{id} has no PR yet; run the developer first");
     };
-    let branch = task.branch.context("task missing branch")?;
-    let wt = worktree_root(&board.repo_path, &branch);
+    let branch = task.branch.clone().context("task missing branch")?;
+    let wt = worktree_path(project, &branch);
 
-    let diff = run("gh", &["pr", "diff", &pr_url], &board.repo_path)?;
+    let diff = run("gh", &["pr", "diff", &pr_url], &project.repo_path)?;
+    let spec_hint = task
+        .spec_slug
+        .as_deref()
+        .map(|s| format!("Spec: {s}. Verify requirement coverage.\n"))
+        .unwrap_or_default();
     let prompt = format!(
-        "Review this pull request for scrum task #{}: {}\
-         \nPR: {}\
+        "Review this pull request for scrum task #{} in project `{}`: {}\
+         \n{spec_hint}PR: {pr_url}\
+         \nAcceptance criteria: {}\
          \nDiff:\n```diff\n{diff}\n```\
-         \nCheck: correctness, security, tests, style. \
+         \nCheck: correctness, security, tests, style, and acceptance criteria. \
          Respond as JSON: {{\"verdict\":\"approve\"|\"changes\",\"notes\":\"...\"}}",
-        id, task.title, pr_url,
+        id, project.route, task.title, task.acceptance_criteria,
     );
-    let reply = ask_agent("CODE REVIEWER", &board.repo_path, &prompt)?;
+    let reply = ask_agent("CODE REVIEWER", &project.repo_path, &prompt, project, actor)?;
     let v = parse_json(&reply)?;
-    let verdict = v.get("verdict").and_then(|x| x.as_str()).unwrap_or("changes");
-    let notes = v.get("notes").and_then(|x| x.as_str()).unwrap_or("").to_string();
+    let verdict = v
+        .get("verdict")
+        .and_then(|x| x.as_str())
+        .unwrap_or("changes");
+    let notes = v
+        .get("notes")
+        .and_then(|x| x.as_str())
+        .unwrap_or("")
+        .to_string();
 
     if verdict == "approve" {
         run(
             "gh",
-            &["pr", "review", &pr_url, "--approve", "--body", &format!("Scrum review approved: {notes}")],
-            &board.repo_path,
+            &[
+                "pr",
+                "review",
+                &pr_url,
+                "--approve",
+                "--body",
+                &format!("Scrum review approved: {notes}"),
+            ],
+            &project.repo_path,
         )?;
-        run("gh", &["pr", "merge", &pr_url, "--squash", "--delete-branch"], &board.repo_path)?;
-        run("git", &["worktree", "remove", wt.to_string_lossy().as_ref()], &board.repo_path)?;
-        board.update(id, |t| {
+        run(
+            "gh",
+            &["pr", "merge", &pr_url, "--squash", "--delete-branch"],
+            &project.repo_path,
+        )?;
+        run(
+            "git",
+            &["worktree", "remove", wt.to_string_lossy().as_ref()],
+            &project.repo_path,
+        )
+        .ok();
+        store.update_task(project.id, id, |t| {
             t.status = Status::Done;
             t.review_notes = Some(notes);
         })?;
     } else {
-        board.update(id, |t| {
+        store.update_task(project.id, id, |t| {
             t.status = Status::ChangesRequested;
             t.review_notes = Some(notes);
         })?;
@@ -218,25 +418,26 @@ pub fn reviewer_work(board: &Board, id: u32) -> Result<()> {
     Ok(())
 }
 
-/// After changes requested: developer addresses review notes on the same branch.
-pub fn developer_rework(board: &Board, id: u32) -> Result<()> {
-    let task = board.get(id).context("task not found")?;
-    let branch = task.branch.context("task missing branch")?;
-    let wt = worktree_root(&board.repo_path, &branch);
+pub fn developer_rework(store: &Store, project: &Project, id: u32, actor: &str) -> Result<()> {
+    let task = store
+        .task(project.id, id)?
+        .with_context(|| format!("task #{id} not found"))?;
+    let branch = task.branch.clone().context("task missing branch")?;
+    let wt = worktree_path(project, &branch);
     let notes = task.review_notes.clone().unwrap_or_default();
 
     run("git", &["pull", "--rebase", "origin", &branch], &wt).ok();
     let prompt = format!(
-        "Code review requested changes on your branch for task #{}: {}\
+        "Code review requested changes on your branch for task #{} in project `{}`: {}\
          \nReviewer notes: {notes}\
          \nFix the issues, run tests/linters, commit with a Conventional Commit message. \
          Do NOT push. Respond as JSON: {{\"summary\":\"...\",\"commit\":\"<sha>\"}}",
-        id, task.title,
+        id, project.route, task.title,
     );
-    let reply = ask_agent("DEVELOPER", &wt, &prompt)?;
+    let reply = ask_agent("DEVELOPER", &wt, &prompt, project, actor)?;
     parse_json(&reply)?;
     run("git", &["push"], &wt)?;
-    board.update(id, |t| t.status = Status::InReview)?;
+    store.update_task(project.id, id, |t| t.status = Status::InReview)?;
     Ok(())
 }
 
@@ -252,6 +453,9 @@ pub fn print_task(task: &Task) {
             .map(|u| format!("\n      PR: {u}"))
             .unwrap_or_default()
     );
+    if let Some(spec) = &task.spec_slug {
+        println!("      spec: {spec}");
+    }
     if let Some(notes) = task.review_notes.as_deref().filter(|n| !n.is_empty()) {
         println!("      review: {notes}");
     }

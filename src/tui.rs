@@ -1,25 +1,44 @@
 use anyhow::Result;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
+use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap};
-use ratatui::Frame;
 
-use crate::board::{Board, Status};
+use crate::board::{Project, Sprint, Status, Store, Task};
 use crate::help;
 use crate::ops;
 
+const EMBER: Color = Color::Rgb(251, 146, 60);
+const INK: Color = Color::Rgb(234, 227, 216);
+const INK_DARK: Color = Color::Rgb(18, 16, 14);
+const MUTED: Color = Color::Rgb(167, 156, 142);
+const DIM: Color = Color::Rgb(125, 115, 103);
+const BACKLOG: Color = Color::Rgb(140, 130, 120);
+const TODO: Color = Color::Rgb(192, 168, 122);
+const REVIEW: Color = Color::Rgb(224, 138, 43);
+const DONE: Color = Color::Rgb(134, 163, 74);
+const DANGER: Color = Color::Rgb(248, 113, 113);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum View {
+    Board,
+    Backlog,
+}
+
 type StatusPred = fn(&Status) -> bool;
-const COLUMNS: &[(&str, StatusPred)] = &[
-    ("Backlog", |s| matches!(s, Status::Backlog)),
-    ("Assigned", |s| matches!(s, Status::Assigned)),
+
+const BOARD_COLUMNS: &[(&str, StatusPred)] = &[
+    ("Todo", |s| matches!(s, Status::Todo)),
     ("Working", |s| {
         matches!(s, Status::InProgress | Status::ChangesRequested)
     }),
     ("Review", |s| matches!(s, Status::InReview)),
     ("Done", |s| matches!(s, Status::Done)),
 ];
+
+const BACKLOG_COLUMNS: &[(&str, StatusPred)] = &[("Backlog", |s| matches!(s, Status::Backlog))];
 
 enum Mode {
     Normal,
@@ -35,7 +54,10 @@ enum Action {
 }
 
 struct App {
-    board: Board,
+    store: Store,
+    project: Project,
+    sprint: Option<Sprint>,
+    view: View,
     col: usize,
     list_states: Vec<ListState>,
     mode: Mode,
@@ -45,11 +67,22 @@ struct App {
     quit: bool,
 }
 
-pub fn run(board: Board) -> Result<()> {
+pub fn run(store: Store, project: Project) -> Result<()> {
+    let sprint = store.active_sprint(project.id)?;
+    let view = if sprint.is_some() {
+        View::Board
+    } else {
+        View::Backlog
+    };
     let mut terminal = ratatui::init();
     let mut app = App {
-        list_states: COLUMNS.iter().map(|_| ListState::default()).collect(),
-        board,
+        list_states: (0..BOARD_COLUMNS.len().max(BACKLOG_COLUMNS.len()))
+            .map(|_| ListState::default())
+            .collect(),
+        store,
+        project,
+        sprint,
+        view,
         col: 0,
         mode: Mode::Normal,
         message: String::new(),
@@ -57,16 +90,16 @@ pub fn run(board: Board) -> Result<()> {
         pending: None,
         quit: false,
     };
+    if app.sprint.is_none() {
+        app.message = "no active sprint — showing product backlog".into();
+    }
     app.fix_selection();
     let res = event_loop(&mut terminal, &mut app);
     ratatui::restore();
     res
 }
 
-fn event_loop(
-    terminal: &mut ratatui::DefaultTerminal,
-    app: &mut App,
-) -> Result<()> {
+fn event_loop(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> Result<()> {
     while !app.quit {
         terminal.draw(|f| draw(f, app))?;
         if let Some(action) = app.pending.take() {
@@ -84,10 +117,29 @@ fn event_loop(
 }
 
 impl App {
+    fn columns(&self) -> &'static [(&'static str, StatusPred)] {
+        match self.view {
+            View::Board => BOARD_COLUMNS,
+            View::Backlog => BACKLOG_COLUMNS,
+        }
+    }
+
+    fn visible_tasks(&self) -> Vec<Task> {
+        let result = match self.view {
+            View::Board => match &self.sprint {
+                Some(sprint) => self.store.sprint_tasks(self.project.id, sprint.id),
+                None => Ok(Vec::new()),
+            },
+            View::Backlog => self.store.backlog_tasks(self.project.id),
+        };
+        result.unwrap_or_default()
+    }
+
     fn tasks_in_col(&self, col: usize) -> Vec<u32> {
-        let pred = COLUMNS[col].1;
-        self.board
-            .tasks()
+        let Some((_, pred)) = self.columns().get(col) else {
+            return Vec::new();
+        };
+        self.visible_tasks()
             .into_iter()
             .filter(|t| pred(&t.status))
             .map(|t| t.id)
@@ -102,10 +154,11 @@ impl App {
     }
 
     fn fix_selection(&mut self) {
+        let count = self.columns().len();
         while self.col > 0 && self.tasks_in_col(self.col).is_empty() {
             self.col -= 1;
         }
-        for c in 0..COLUMNS.len() {
+        for c in 0..count {
             let n = self.tasks_in_col(c).len();
             let ls = &mut self.list_states[c];
             if n == 0 {
@@ -114,14 +167,18 @@ impl App {
                 ls.select(Some(n - 1));
             }
         }
+        if self.col >= count {
+            self.col = count.saturating_sub(1);
+        }
     }
 
     fn move_col(&mut self, delta: i32) {
+        let count = self.columns().len() as i32;
         let mut c = self.col as i32 + delta;
-        while (0..COLUMNS.len() as i32).contains(&c) && self.tasks_in_col(c as usize).is_empty() {
+        while (0..count).contains(&c) && self.tasks_in_col(c as usize).is_empty() {
             c += delta;
         }
-        if (0..COLUMNS.len() as i32).contains(&c) {
+        if (0..count).contains(&c) {
             self.col = c as usize;
         }
     }
@@ -136,6 +193,38 @@ impl App {
         ls.select(Some(i.clamp(0, n as i32 - 1) as usize));
     }
 
+    fn cycle_view(&mut self) {
+        self.view = match self.view {
+            View::Board => View::Backlog,
+            View::Backlog => View::Board,
+        };
+        self.col = 0;
+        if self.view == View::Board && self.sprint.is_none() {
+            self.message = "no active sprint; use `s` to select a sprint".into();
+        }
+        self.fix_selection();
+    }
+
+    fn cycle_sprint(&mut self) {
+        let Ok(sprints) = self.store.sprints(self.project.id) else {
+            return;
+        };
+        if sprints.is_empty() {
+            self.message = "no sprints yet; create one with `scrumforge sprint add`".into();
+            return;
+        }
+        let current = self
+            .sprint
+            .as_ref()
+            .and_then(|s| sprints.iter().position(|x| x.id == s.id));
+        let next = current.map_or(0, |i| (i + 1) % sprints.len());
+        self.sprint = Some(sprints[next].clone());
+        self.view = View::Board;
+        self.col = 0;
+        self.message = format!("viewing sprint {}", sprints[next].number);
+        self.fix_selection();
+    }
+
     fn start_busy(&mut self, msg: &str) {
         self.busy = Some(msg.to_string());
     }
@@ -143,14 +232,18 @@ impl App {
     fn finish(&mut self, msg: String) {
         self.busy = None;
         self.message = msg;
+        let _ = self.sprint.is_none();
         self.fix_selection();
     }
 
     fn execute(&mut self, action: Action) {
+        let actor = "product-owner";
         let res = match action {
-            Action::Request(text) => ops::request(&mut self.board, &text).map(|l| l.join("\n")),
-            Action::Run(id) => ops::run_task(&mut self.board, id),
-            Action::Rework(id) => ops::rework(&mut self.board, id),
+            Action::Request(text) => {
+                ops::request(&self.store, &self.project, &text, actor).map(|l| l.join("\n"))
+            }
+            Action::Run(id) => ops::run_task(&self.store, &self.project, id, actor),
+            Action::Rework(id) => ops::rework(&self.store, &self.project, id, actor),
         };
         self.finish(res.unwrap_or_else(|e| format!("error: {e:#}")));
     }
@@ -167,9 +260,11 @@ impl App {
                     KeyCode::Char('r') => {
                         if let Some(id) = self.selected_id() {
                             let who = self
-                                .board
-                                .get(id)
-                                .and_then(|t| t.assignee.clone())
+                                .store
+                                .task(self.project.id, id)
+                                .ok()
+                                .flatten()
+                                .and_then(|t| t.assignee)
                                 .unwrap_or_else(|| "developer".into());
                             self.start_busy(&format!("{who} working on task #{id}…"));
                             self.pending = Some(Action::Run(id));
@@ -213,6 +308,8 @@ impl App {
                 KeyCode::Right | KeyCode::Char('l') => self.move_col(1),
                 KeyCode::Up | KeyCode::Char('k') => self.move_row(-1),
                 KeyCode::Down | KeyCode::Char('j') => self.move_row(1),
+                KeyCode::Char('b') => self.cycle_view(),
+                KeyCode::Char('s') => self.cycle_sprint(),
                 KeyCode::Char(':') => {
                     self.mode = Mode::Command {
                         prompt: "> ".into(),
@@ -241,9 +338,11 @@ impl App {
                 KeyCode::Char('r') => {
                     if let Some(id) = self.selected_id() {
                         let who = self
-                            .board
-                            .get(id)
-                            .and_then(|t| t.assignee.clone())
+                            .store
+                            .task(self.project.id, id)
+                            .ok()
+                            .flatten()
+                            .and_then(|t| t.assignee)
                             .unwrap_or_else(|| "developer".into());
                         self.start_busy(&format!("{who} working on task #{id}…"));
                         self.pending = Some(Action::Run(id));
@@ -277,17 +376,18 @@ impl App {
         if line.is_empty() {
             return;
         }
+        let actor = "product-owner";
         let res: Result<String> = match prompt {
             "review: " => {
                 if let Some(id) = self.selected_id() {
-                    ops::review(&mut self.board, id, line)
+                    ops::review(&self.store, &self.project, id, line, actor)
                 } else {
                     Err(anyhow::anyhow!("no task selected"))
                 }
             }
-            "add: " => ops::add_backlog_task(&mut self.board, line),
+            "add: " => ops::add_backlog_task(&self.store, &self.project, line, None, actor),
             "request: " => {
-                self.start_busy("scrum master is planning…");
+                self.start_busy("planning…");
                 self.pending = Some(Action::Request(line.to_string()));
                 return;
             }
@@ -312,18 +412,44 @@ impl App {
                     },
                     "assign" => match rest.split_once(' ') {
                         Some((id, who)) => match id.parse::<u32>() {
-                            Ok(id) => ops::assign(&mut self.board, id, who),
+                            Ok(id) => ops::assign(&self.store, &self.project, id, who, actor),
                             Err(_) => Err(anyhow::anyhow!("usage: assign <id> <who>")),
                         },
                         None => Err(anyhow::anyhow!("usage: assign <id> <who>")),
                     },
                     "review" => match rest.split_once(' ') {
                         Some((id, feedback)) => match id.parse::<u32>() {
-                            Ok(id) => ops::review(&mut self.board, id, feedback),
+                            Ok(id) => ops::review(&self.store, &self.project, id, feedback, actor),
                             Err(_) => Err(anyhow::anyhow!("usage: review <id> <feedback>")),
                         },
                         None => Err(anyhow::anyhow!("usage: review <id> <feedback>")),
                     },
+                    "sprint" => {
+                        let (sub, arg) = rest.split_once(' ').unwrap_or((rest, ""));
+                        match sub {
+                            "activate" => match arg.parse::<u32>() {
+                                Ok(number) => self
+                                    .store
+                                    .activate_sprint(self.project.id, number)
+                                    .map(|s| format!("activated sprint {}", s.number)),
+                                Err(_) => Err(anyhow::anyhow!("usage: sprint activate <number>")),
+                            },
+                            "close" => {
+                                let mut parts = arg.split_whitespace();
+                                let number = parts.next().and_then(|v| v.parse::<u32>().ok());
+                                match number {
+                                    Some(number) => self
+                                        .store
+                                        .close_sprint(self.project.id, number, parts.next())
+                                        .map(|s| format!("closed sprint {}", s.number)),
+                                    None => Err(anyhow::anyhow!(
+                                        "usage: sprint close <number> [backlog]"
+                                    )),
+                                }
+                            }
+                            _ => Err(anyhow::anyhow!("usage: sprint activate|close")),
+                        }
+                    }
                     "quit" => {
                         self.quit = true;
                         return;
@@ -337,13 +463,13 @@ impl App {
     }
 }
 
-fn column_color(col: usize) -> Color {
-    match col {
-        0 => Color::Gray,
-        1 => Color::Cyan,
-        2 => Color::Yellow,
-        3 => Color::Magenta,
-        _ => Color::Green,
+fn column_color(col: usize, view: View) -> Color {
+    match (view, col) {
+        (View::Backlog, _) => BACKLOG,
+        (_, 0) => TODO,
+        (_, 1) => EMBER,
+        (_, 2) => REVIEW,
+        _ => DONE,
     }
 }
 
@@ -351,18 +477,18 @@ fn draw(f: &mut Frame, app: &mut App) {
     let [banner, main, detail, footer] = Layout::vertical([
         Constraint::Length(3),
         Constraint::Min(6),
-        Constraint::Length(8),
+        Constraint::Length(9),
         Constraint::Length(2),
     ])
     .areas(f.area());
 
     draw_banner(f, banner, app);
+    let columns = app.columns();
     let cols = Layout::horizontal(
-        std::iter::repeat_n(Constraint::Fill(1), COLUMNS.len())
-            .collect::<Vec<_>>(),
+        std::iter::repeat_n(Constraint::Fill(1), columns.len()).collect::<Vec<_>>(),
     )
     .split(main);
-    for (c, (title, _)) in COLUMNS.iter().enumerate() {
+    for (c, (title, _)) in columns.iter().enumerate() {
         draw_column(f, app, cols[c], c, title);
     }
     draw_detail(f, app, detail);
@@ -380,37 +506,58 @@ fn draw(f: &mut Frame, app: &mut App) {
 }
 
 fn draw_banner(f: &mut Frame, area: Rect, app: &App) {
-    let tasks = app.board.tasks();
+    let tasks = app.visible_tasks();
     let total = tasks.len();
-    let done = tasks
-        .iter()
-        .filter(|t| t.status == Status::Done)
-        .count();
+    let done = tasks.iter().filter(|t| t.status == Status::Done).count();
+    let sprint = app
+        .sprint
+        .as_ref()
+        .map(|s| format!("sprint {} {} · {}", s.number, s.name, s.status))
+        .unwrap_or_else(|| "no sprint".into());
+    let view = match app.view {
+        View::Board => "board",
+        View::Backlog => "backlog",
+    };
     let title = Line::from(vec![
-        Span::styled(" ⚒ scrumforge ", Style::default().fg(Color::Black).bg(Color::LightYellow).add_modifier(Modifier::BOLD)),
-        Span::raw("  product owner console  "),
         Span::styled(
-            format!("{done}/{total} done"),
-            Style::default().fg(Color::Green),
+            " scrumforge ",
+            Style::default()
+                .fg(INK_DARK)
+                .bg(EMBER)
+                .add_modifier(Modifier::BOLD),
         ),
-        Span::raw(format!("  · repo {}", app.board.repo_path.display())),
+        Span::styled(
+            format!(" {} ({}) ", app.project.route, app.project.methodology),
+            Style::default().fg(MUTED),
+        ),
+        Span::styled(format!("{view} · {sprint}"), Style::default().fg(INK)),
+        Span::styled(format!("  {done}/{total} done"), Style::default().fg(DONE)),
+        Span::styled(
+            format!("  · {}", app.project.repo_path.display()),
+            Style::default().fg(DIM),
+        ),
     ]);
     f.render_widget(Paragraph::new(title), area);
 }
 
 fn draw_column(f: &mut Frame, app: &mut App, area: Rect, col: usize, title: &str) {
-    let color = column_color(col);
+    let color = column_color(col, app.view);
     let ids = app.tasks_in_col(col);
     let items: Vec<ListItem> = ids
         .iter()
-        .filter_map(|id| app.board.get(*id))
+        .filter_map(|id| app.store.task(app.project.id, *id).ok().flatten())
         .map(|t| {
             let assignee = t.assignee.as_deref().unwrap_or("—");
+            let spec = t
+                .spec_slug
+                .as_deref()
+                .map(|s| format!(" ◇{s}"))
+                .unwrap_or_default();
             let marks = if t.pr_url.is_some() { " ⛁" } else { "" };
             ListItem::new(Line::from(vec![
                 Span::styled(format!("#{} ", t.id), Style::default().fg(color).bold()),
-                Span::raw(format!("{}{}", t.title, marks)),
-                Span::styled(format!(" [{assignee}]"), Style::default().fg(Color::DarkGray)),
+                Span::raw(format!("{}{}{}", t.title, spec, marks)),
+                Span::styled(format!(" [{assignee}]"), Style::default().fg(DIM)),
             ]))
         })
         .collect();
@@ -420,50 +567,89 @@ fn draw_column(f: &mut Frame, app: &mut App, area: Rect, col: usize, title: &str
         .border_style(if app.col == col {
             Style::default().fg(color).add_modifier(Modifier::BOLD)
         } else {
-            Style::default().fg(Color::DarkGray)
+            Style::default().fg(DIM)
         });
     let list = List::new(items)
         .block(block)
-        .highlight_style(Style::default().bg(color).fg(Color::Black).add_modifier(Modifier::BOLD))
+        .highlight_style(
+            Style::default()
+                .bg(color)
+                .fg(INK_DARK)
+                .add_modifier(Modifier::BOLD),
+        )
         .highlight_symbol("▶ ");
     f.render_stateful_widget(list, area, &mut app.list_states[col]);
 }
 
 fn draw_detail(f: &mut Frame, app: &App, area: Rect) {
-    let body = match app.selected_id().and_then(|id| app.board.get(id)) {
-        Some(t) => vec![
-            Line::from(vec![
-                Span::styled(format!("#{} ", t.id), Style::default().fg(Color::Cyan).bold()),
-                Span::styled(t.title.clone(), Style::default().add_modifier(Modifier::BOLD)),
-                Span::styled(format!("  [{}]", t.status), Style::default().fg(Color::Yellow)),
-            ]),
-            Line::from(Span::styled(
-                if t.description.is_empty() { "(no description)".into() } else { t.description.clone() },
-                Style::default().fg(Color::Gray),
-            )),
-            Line::from(vec![
-                Span::styled("assignee: ", Style::default().fg(Color::DarkGray)),
+    let body = match app
+        .selected_id()
+        .and_then(|id| app.store.task(app.project.id, id).ok().flatten())
+    {
+        Some(t) => {
+            let mut lines = vec![
+                Line::from(vec![
+                    Span::styled(format!("#{} ", t.id), Style::default().fg(EMBER).bold()),
+                    Span::styled(
+                        t.title.clone(),
+                        Style::default().add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(format!("  [{}]", t.status), Style::default().fg(REVIEW)),
+                ]),
+                Line::from(Span::styled(
+                    if t.description.is_empty() {
+                        "(no description)".into()
+                    } else {
+                        t.description.clone()
+                    },
+                    Style::default().fg(INK),
+                )),
+            ];
+            if !t.acceptance_criteria.is_empty() {
+                lines.push(Line::from(vec![
+                    Span::styled("acceptance: ", Style::default().fg(DIM)),
+                    Span::raw(t.acceptance_criteria.clone()),
+                ]));
+            }
+            lines.push(Line::from(vec![
+                Span::styled("assignee: ", Style::default().fg(DIM)),
                 Span::raw(t.assignee.clone().unwrap_or_else(|| "unassigned".into())),
-                Span::styled("   branch: ", Style::default().fg(Color::DarkGray)),
+                Span::styled("   branch: ", Style::default().fg(DIM)),
                 Span::raw(t.branch.clone().unwrap_or_else(|| "—".into())),
-            ]),
-            t.pr_url.clone().map(|u| Line::from(vec![
-                Span::styled("PR: ", Style::default().fg(Color::DarkGray)),
-                Span::styled(u, Style::default().fg(Color::LightBlue).underlined()),
-            ])).unwrap_or_default(),
-            t.review_notes.clone().filter(|n| !n.is_empty()).map(|n| Line::from(vec![
-                Span::styled("review: ", Style::default().fg(Color::DarkGray)),
-                Span::raw(n),
-            ])).unwrap_or_default(),
-        ],
+            ]));
+            if let Some(spec) = t.spec_slug {
+                lines.push(Line::from(vec![
+                    Span::styled("spec: ", Style::default().fg(DIM)),
+                    Span::raw(spec),
+                    Span::styled(
+                        t.requirement_key
+                            .map(|k| format!("  requirement: {k}"))
+                            .unwrap_or_default(),
+                        Style::default().fg(DIM),
+                    ),
+                ]));
+            }
+            if let Some(u) = t.pr_url {
+                lines.push(Line::from(vec![
+                    Span::styled("PR: ", Style::default().fg(DIM)),
+                    Span::styled(u, Style::default().fg(EMBER).underlined()),
+                ]));
+            }
+            if let Some(n) = t.review_notes.filter(|n| !n.is_empty()) {
+                lines.push(Line::from(vec![
+                    Span::styled("review: ", Style::default().fg(DIM)),
+                    Span::raw(n),
+                ]));
+            }
+            lines
+        }
         None => vec![Line::from(Span::styled(
-            "no task selected — press R to ask the scrum master for a plan",
-            Style::default().fg(Color::DarkGray),
+            "no task selected — press R to plan, a to add, b for backlog",
+            Style::default().fg(DIM),
         ))],
     };
     f.render_widget(
-        Paragraph::new(body)
-            .block(Block::default().borders(Borders::ALL).title(" Task ")),
+        Paragraph::new(body).block(Block::default().borders(Borders::ALL).title(" Task ")),
         area,
     );
 }
@@ -471,92 +657,117 @@ fn draw_detail(f: &mut Frame, app: &App, area: Rect) {
 fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
     let line = match &app.mode {
         Mode::Command { prompt, input } => Line::from(vec![
-            Span::styled(prompt.clone(), Style::default().fg(Color::Cyan).bold()),
+            Span::styled(prompt.clone(), Style::default().fg(EMBER).bold()),
             Span::raw(input.clone()),
-            Span::styled("▏", Style::default().fg(Color::Cyan)),
+            Span::styled("▏", Style::default().fg(EMBER)),
         ]),
         _ => Line::from(vec![
-            Span::styled("R", Style::default().fg(Color::Green).bold()),
+            Span::styled("R", Style::default().fg(EMBER).bold()),
             Span::raw("equest  "),
-            Span::styled("a", Style::default().fg(Color::Green).bold()),
+            Span::styled("a", Style::default().fg(EMBER).bold()),
             Span::raw("dd  "),
-            Span::styled("r", Style::default().fg(Color::Green).bold()),
+            Span::styled("r", Style::default().fg(EMBER).bold()),
             Span::raw("un  "),
-            Span::styled("w", Style::default().fg(Color::Green).bold()),
+            Span::styled("w", Style::default().fg(EMBER).bold()),
             Span::raw("rework  "),
-            Span::styled("v", Style::default().fg(Color::Green).bold()),
+            Span::styled("v", Style::default().fg(EMBER).bold()),
             Span::raw("review  "),
-            Span::styled(":", Style::default().fg(Color::Green).bold()),
+            Span::styled("b", Style::default().fg(EMBER).bold()),
+            Span::raw("acklog  "),
+            Span::styled("s", Style::default().fg(EMBER).bold()),
+            Span::raw("print  "),
+            Span::styled(":", Style::default().fg(EMBER).bold()),
             Span::raw("cmd  "),
-            Span::styled("?", Style::default().fg(Color::Green).bold()),
+            Span::styled("?", Style::default().fg(EMBER).bold()),
             Span::raw("help  "),
-            Span::styled("q", Style::default().fg(Color::Red).bold()),
+            Span::styled("q", Style::default().fg(DANGER).bold()),
             Span::raw("uit"),
-            Span::styled(format!("  │ {}", app.message), Style::default().fg(Color::Yellow)),
+            Span::styled(format!("  │ {}", app.message), Style::default().fg(REVIEW)),
         ]),
     };
-    f.render_widget(
-        Paragraph::new(line).wrap(Wrap { trim: false }),
-        area,
-    );
+    f.render_widget(Paragraph::new(line).wrap(Wrap { trim: false }), area);
 }
 
 fn draw_busy(f: &mut Frame, msg: &str) {
     let area = centered(f.area(), 50, 20);
-    let spinner = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏";
-    let frame_char = spinner.chars().next().unwrap_or('*');
     let text = Line::from(vec![
-        Span::styled(format!("{frame_char} "), Style::default().fg(Color::Cyan).bold()),
+        Span::styled("⠋ ", Style::default().fg(EMBER).bold()),
         Span::styled(msg, Style::default().add_modifier(Modifier::BOLD)),
-        Span::styled("\n(agents can take minutes — Ctrl-C aborts)", Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            "\n(agents can take minutes — Ctrl-C aborts)",
+            Style::default().fg(DIM),
+        ),
     ]);
     f.render_widget(Clear, area);
     f.render_widget(
-        Paragraph::new(text)
-            .centered()
-            .block(Block::default().borders(Borders::ALL).title(" ⚙ working ").border_style(Style::default().fg(Color::Cyan))),
+        Paragraph::new(text).centered().block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" working ")
+                .border_style(Style::default().fg(EMBER)),
+        ),
         area,
     );
 }
 
 fn draw_task_modal(f: &mut Frame, app: &App) {
     let area = centered(f.area(), 60, 60);
-    let task = app.selected_id().and_then(|id| app.board.get(id));
+    let task = app
+        .selected_id()
+        .and_then(|id| app.store.task(app.project.id, id).ok().flatten());
     let body = match task {
         Some(t) => vec![
             Line::from(vec![
-                Span::styled(format!("#{} ", t.id), Style::default().fg(Color::Cyan).bold()),
-                Span::styled(t.title.clone(), Style::default().add_modifier(Modifier::BOLD)),
+                Span::styled(format!("#{} ", t.id), Style::default().fg(EMBER).bold()),
+                Span::styled(
+                    t.title.clone(),
+                    Style::default().add_modifier(Modifier::BOLD),
+                ),
             ]),
             Line::from(Span::styled(
-                if t.description.is_empty() { "(no description)".into() } else { t.description.clone() },
-                Style::default().fg(Color::Gray),
+                if t.description.is_empty() {
+                    "(no description)".into()
+                } else {
+                    t.description.clone()
+                },
+                Style::default().fg(INK),
             )),
             "".into(),
             Line::from(vec![
-                Span::styled("status:   ", Style::default().fg(Color::DarkGray)),
-                Span::styled(format!("{}", t.status), Style::default().fg(Color::Yellow)),
+                Span::styled("status:   ", Style::default().fg(DIM)),
+                Span::styled(format!("{}", t.status), Style::default().fg(REVIEW)),
             ]),
             Line::from(vec![
-                Span::styled("assignee: ", Style::default().fg(Color::DarkGray)),
+                Span::styled("assignee: ", Style::default().fg(DIM)),
                 Span::raw(t.assignee.clone().unwrap_or_else(|| "unassigned".into())),
             ]),
             Line::from(vec![
-                Span::styled("branch:   ", Style::default().fg(Color::DarkGray)),
+                Span::styled("branch:   ", Style::default().fg(DIM)),
                 Span::raw(t.branch.clone().unwrap_or_else(|| "—".into())),
             ]),
-            t.pr_url.clone().map(|u| Line::from(vec![
-                Span::styled("PR:       ", Style::default().fg(Color::DarkGray)),
-                Span::styled(u, Style::default().fg(Color::LightBlue).underlined()),
-            ])).unwrap_or_default(),
-            t.review_notes.clone().filter(|n| !n.is_empty()).map(|n| Line::from(vec![
-                Span::styled("review:   ", Style::default().fg(Color::DarkGray)),
-                Span::raw(n),
-            ])).unwrap_or_default(),
+            t.pr_url
+                .clone()
+                .map(|u| {
+                    Line::from(vec![
+                        Span::styled("PR:       ", Style::default().fg(DIM)),
+                        Span::styled(u, Style::default().fg(EMBER).underlined()),
+                    ])
+                })
+                .unwrap_or_default(),
+            t.review_notes
+                .clone()
+                .filter(|n| !n.is_empty())
+                .map(|n| {
+                    Line::from(vec![
+                        Span::styled("review:   ", Style::default().fg(DIM)),
+                        Span::raw(n),
+                    ])
+                })
+                .unwrap_or_default(),
             "".into(),
             Line::from(Span::styled(
                 "r run · w rework · Esc close",
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(DIM),
             )),
         ],
         None => vec![Line::from("no task selected")],
@@ -570,17 +781,16 @@ fn draw_task_modal(f: &mut Frame, app: &App) {
     );
 }
 
-/// The `?` overlay. Keys, flow, and notes come from [`crate::help`] — the same
-/// source `scrumforge help tui` prints — so the two cannot drift apart.
 fn draw_help(f: &mut Frame) {
-    let heading = |text: &'static str| Line::from(Span::styled(text, Style::default().fg(Color::Cyan).bold()));
+    let heading =
+        |text: &'static str| Line::from(Span::styled(text, Style::default().fg(EMBER).bold()));
 
     let mut lines = vec![heading("keys")];
     lines.extend(help::KEYS.iter().map(|(key, desc)| {
         Line::from(vec![
             Span::styled(
                 format!(" {key:<width$} ", width = help::KEY_WIDTH),
-                Style::default().fg(Color::Yellow),
+                Style::default().fg(REVIEW),
             ),
             Span::raw(*desc),
         ])
@@ -591,19 +801,18 @@ fn draw_help(f: &mut Frame) {
     lines.extend(help::FLOW.iter().map(|l| Line::from(format!(" {l}"))));
 
     lines.push("".into());
-    lines.extend(help::TUI_NOTES.iter().map(|n| {
-        Line::from(Span::styled(format!(" {n}"), Style::default().fg(Color::DarkGray)))
-    }));
+    lines.extend(
+        help::TUI_NOTES
+            .iter()
+            .map(|n| Line::from(Span::styled(format!(" {n}"), Style::default().fg(DIM)))),
+    );
 
     lines.push("".into());
     lines.push(Line::from(Span::styled(
         " press any key to close · full guide: scrumforge help",
-        Style::default().fg(Color::DarkGray),
+        Style::default().fg(DIM),
     )));
 
-    // Size to the content rather than a percentage, so no binding gets wrapped
-    // or clipped on a narrow terminal; Wrap is only the fallback for terminals
-    // too small even for that.
     let width = lines.iter().map(Line::width).max().unwrap_or(0) as u16 + 2;
     let height = lines.len() as u16 + 2;
     let area = centered_size(f.area(), width, height);
@@ -617,7 +826,6 @@ fn draw_help(f: &mut Frame) {
     );
 }
 
-/// A `width` x `height` rect centred in `area`, shrunk to fit if it is bigger.
 fn centered_size(area: Rect, width: u16, height: u16) -> Rect {
     let width = width.min(area.width);
     let height = height.min(area.height);
@@ -630,8 +838,16 @@ fn centered_size(area: Rect, width: u16, height: u16) -> Rect {
 }
 
 fn centered(area: Rect, pct_x: u16, pct_y: u16) -> Rect {
-    let v = Layout::vertical([Constraint::Percentage(pct_y), Constraint::Percentage(100 - pct_y)]).split(area);
-    let h = Layout::horizontal([Constraint::Percentage(pct_x), Constraint::Percentage(100 - pct_x)]).split(v[0].inner(ratatui::layout::Margin::new(0, 0)));
+    let v = Layout::vertical([
+        Constraint::Percentage(pct_y),
+        Constraint::Percentage(100 - pct_y),
+    ])
+    .split(area);
+    let h = Layout::horizontal([
+        Constraint::Percentage(pct_x),
+        Constraint::Percentage(100 - pct_x),
+    ])
+    .split(v[0].inner(ratatui::layout::Margin::new(0, 0)));
     let inner = h[0];
     let dy = area.height.saturating_sub(inner.height) / 2;
     let dx = area.width.saturating_sub(inner.width) / 2;
@@ -646,8 +862,8 @@ fn centered(area: Rect, pct_x: u16, pct_y: u16) -> Rect {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ratatui::backend::TestBackend;
     use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
 
     fn render_help(width: u16, height: u16) -> String {
         let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
@@ -663,21 +879,27 @@ mod tests {
             .join("\n")
     }
 
-    /// The overlay must show every binding help.rs defines, so adding one there
-    /// cannot leave the TUI out of date.
     #[test]
     fn help_overlay_renders_every_key_from_help_module() {
         let rendered = render_help(120, 40);
         for (key, desc) in help::KEYS {
-            assert!(rendered.contains(key), "missing key {key} in overlay:\n{rendered}");
-            assert!(rendered.contains(desc), "missing desc {desc} in overlay:\n{rendered}");
+            assert!(
+                rendered.contains(key),
+                "missing key {key} in overlay:\n{rendered}"
+            );
+            assert!(
+                rendered.contains(desc),
+                "missing desc {desc} in overlay:\n{rendered}"
+            );
         }
         for line in help::FLOW {
-            assert!(rendered.contains(line), "missing flow line in overlay:\n{rendered}");
+            assert!(
+                rendered.contains(line),
+                "missing flow line in overlay:\n{rendered}"
+            );
         }
     }
 
-    /// Nothing may be truncated at the smallest terminal we expect to run in.
     #[test]
     fn help_overlay_fits_an_80x24_terminal() {
         let rendered = render_help(80, 24);
